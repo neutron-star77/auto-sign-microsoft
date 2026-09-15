@@ -34,6 +34,7 @@
 - 本项目已初始化 mp-engineering 工作流（见上方约定）。新任务走 `#42 my-newtask-flow`，存量审计/优化走 `#40 my-audit-existing-project`。
 - 状态：已初始化（本 CLAUDE.md 即 `## Agent skills` 载体）。
 - 每次大改动前先按 `improve-codebase-architecture` 扫描调度/执行热区，再按 `CONTEXT.md` 与 ADR 校验术语和调度所有权；调度修改必须保持 `nas_selfheal.sh` 为唯一事实源。
+- **改前先提交（repo 已 `git init`，基线锚点 `v20260916_baseline`）**：改任何源文件前，若工作区有未提交改动，先 `git commit` 生成"改动前快照"再动；大改动/跨模块重构前先 `git add . && git commit -m "pre:<特性>"` 留回滚点。回滚优先 `git checkout <tag> -- <文件>` 单文件回滚；手工 `.bak` 仅作 NAS 物理快照。敏感文件（`storage_state.json`/`edge_profile/`/`authorized_keys_seed.txt`）已被 `.gitignore` 强制隔离，**任何情况都不得提交这些文件**。
 
 ## 5. 跨项目通用记忆（不在此重复）
 
