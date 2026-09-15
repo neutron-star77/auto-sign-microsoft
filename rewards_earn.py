@@ -19,6 +19,7 @@ import sys
 import time
 import json
 import traceback
+from dataclasses import dataclass, field
 from datetime import datetime
 
 from playwright.async_api import async_playwright, BrowserContext, Page, Locator
@@ -68,9 +69,19 @@ def _install_log():
 
 
 # ====================== 邮件通知（NAS 定时任务结果推送） ======================
-LAST_RUN_FAILED = False
-# 收尾复检后仍未完成的任务清单：写进结果邮件，避免要人工比对网页才发现漏做
-UNFINISHED: list = []
+# D1：本脚本运行期全部可变状态收敛进单一 RunState 对象（替代 5 个松散模块全局），
+# 一眼看清有哪些跨函数状态、不再需要散落的 `global` 声明。
+@dataclass
+class RunState:
+    last_run_failed: bool = False
+    points_before: int | None = None        # 积分差额自审：运行前可用积分（读不到为 None）
+    points_after: int | None = None         # 运行后可用积分
+    daily_set_result: dict | None = None    # 每日活动三张卡片 +「可领取」处理结果（供邮件汇报）
+    unfinished: list = field(default_factory=list)  # 收尾复检仍未完成清单（写进结果邮件）
+    structural_failures: list = field(default_factory=list)  # 结构级异常（发【结构异常】告警邮件）
+
+
+run_state = RunState()
 
 
 # ====================== 本月攻略 punchcard 的稳定识别（跨月免维护） ======================
@@ -128,14 +139,8 @@ def current_month_week_index(now: datetime | None = None) -> int:
 
 
 # 结构级异常（如「本月攻略定位器整月零匹配」）单独收集，发【结构异常】告警邮件，
-# 与日常「有 N 项未完成」的噪音级邮件区分（见 ADR-0002 §3.5）。
-STRUCTURAL_FAILURES: list = []
-
-# 积分差额自审：运行前后「可用积分」余额（best-effort，读不到为 None）
-POINTS_BEFORE = None
-POINTS_AFTER = None
-DAILY_SET_RESULT = None  # 每日活动三张卡片 + 「可领取」奖励积分的处理结果（供邮件汇报）
-
+# 与日常「有 N 项未完成」的噪音级邮件区分（见 ADR-0002 §3.5）——已收纳进上方 run_state（D1）。
+# 积分差额自审：运行前后「可用积分」余额等全部运行期状态，同上收敛进 run_state。
 
 def _monthly_state_path() -> str:
     base = "/app/data" if IS_NAS else os.path.dirname(os.path.abspath(__file__))
@@ -148,21 +153,31 @@ def _mail_state_path() -> str:
     return os.path.join(base, "mail_notify_state.json")
 
 
-def _load_mail_state() -> dict:
+def _load_json(path, default):
+    """D6：统一『读 JSON 状态文件』——三态(mail/monthly/weekly)共用，遇错返回默认。"""
     try:
-        with open(_mail_state_path(), "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data if isinstance(data, dict) else {}
+        with open(path, "r", encoding="utf-8") as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else default
     except Exception:
-        return {}
+        return default
+
+
+def _save_json(path, data, err_label="写入状态文件失败"):
+    """D6：统一『写 JSON 状态文件』，错误提示统一由调用方给 err_label。"""
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"    ⚠ {err_label}: {e}")
+
+
+def _load_mail_state() -> dict:
+    return _load_json(_mail_state_path(), {})
 
 
 def _save_mail_state(state: dict) -> None:
-    try:
-        with open(_mail_state_path(), "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"[邮件] 写入去重状态失败：{e}")
+    _save_json(_mail_state_path(), state, "[邮件] 写入去重状态失败")
 
 
 def _mail_day_key() -> str:
@@ -174,18 +189,14 @@ def _write_monthly_state(weekly_done: int, weekly_total: int) -> None:
 
     仅在确实找到卡片、完成扫描时调用；定位失败（零匹配）不写，留给看门狗发现。
     """
-    try:
-        data = {
-            "month": time.strftime("%Y-%m"),
-            "weekly_done": weekly_done,
-            "weekly_total": weekly_total,
-            "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        with open(_monthly_state_path(), "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        print(f"    已写入月度进度 monthly_state.json: {weekly_done}/{weekly_total}")
-    except Exception as e:
-        print(f"    ⚠ 写入 monthly_state.json 失败: {e}")
+    data = {
+        "month": time.strftime("%Y-%m"),
+        "weekly_done": weekly_done,
+        "weekly_total": weekly_total,
+        "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    _save_json(_monthly_state_path(), data, "写入 monthly_state.json 失败")
+    print(f"    已写入月度进度 monthly_state.json: {weekly_done}/{weekly_total}")
 
 
 # ====================== 每周点击门控（earn 周任务「每周一次」） ======================
@@ -198,20 +209,11 @@ def _weekly_state_path() -> str:
 
 
 def _load_weekly_state() -> dict:
-    try:
-        with open(_weekly_state_path(), "r", encoding="utf-8") as f:
-            _d = json.load(f)
-            return _d if isinstance(_d, dict) else {}
-    except Exception:
-        return {}
+    return _load_json(_weekly_state_path(), {})
 
 
 def _save_weekly_state(st: dict) -> None:
-    try:
-        with open(_weekly_state_path(), "w", encoding="utf-8") as f:
-            json.dump(st, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"    ⚠ 写入 weekly_click_state.json 失败: {e}")
+    _save_json(_weekly_state_path(), st, "写入 weekly_click_state.json 失败")
 
 
 def _week_key(now: datetime | None = None) -> str:
@@ -262,9 +264,9 @@ async def humanize_read(popup: Page, min_t: float = 8.0, max_t: float = 18.0):
     """
     t0 = time.time()
     try:
-        await popup.mouse.wheel(0, random.randint(200, 700)); await asyncio.sleep(rand(1.5, 3.5))
-        await popup.mouse.wheel(0, random.randint(300, 900)); await asyncio.sleep(rand(1.5, 4.0))
-        await popup.mouse.wheel(0, -random.randint(200, 600)); await asyncio.sleep(rand(1.0, 2.5))
+        await popup.mouse.wheel(0, random.randint(200, 700)); await human_pause(1.5, 3.5)
+        await popup.mouse.wheel(0, random.randint(300, 900)); await human_pause(1.5, 4.0)
+        await popup.mouse.wheel(0, -random.randint(200, 600)); await human_pause(1.0, 2.5)
     except Exception:
         pass
     remain = rand(min_t, max_t) - (time.time() - t0)
@@ -359,23 +361,23 @@ def _build_mail_body(failed, error=""):
         tail = "(无法读取运行日志)"
     if failed:
         head = "任务执行失败，请检查登录态或页面选择器。"
-    elif UNFINISHED:
-        head = f"任务已执行，但收尾复检发现 {len(UNFINISHED)} 项仍未完成（已自动重试一次）："
-        head += "\n" + "\n".join(f"  · {t}" for t in UNFINISHED)
+    elif run_state.unfinished:
+        head = f"任务已执行，但收尾复检发现 {len(run_state.unfinished)} 项仍未完成（已自动重试一次）："
+        head += "\n" + "\n".join(f"  · {t}" for t in run_state.unfinished)
     else:
         head = "任务执行成功（收尾复检：页面上所有任务均已标记完成）。"
     if error:
         head += f"\n错误信息：{error}"
     # 积分差额自审：确认「积分真的涨了」，而非仅看页面「已完成」标记
     try:
-        if POINTS_BEFORE is not None or POINTS_AFTER is not None:
-            pb = "?" if POINTS_BEFORE is None else str(POINTS_BEFORE)
-            pa = "?" if POINTS_AFTER is None else str(POINTS_AFTER)
-            if POINTS_BEFORE is not None and POINTS_AFTER is not None:
-                delta = POINTS_AFTER - POINTS_BEFORE
+        if run_state.points_before is not None or run_state.points_after is not None:
+            pb = "?" if run_state.points_before is None else str(run_state.points_before)
+            pa = "?" if run_state.points_after is None else str(run_state.points_after)
+            if run_state.points_before is not None and run_state.points_after is not None:
+                delta = run_state.points_after - run_state.points_before
                 if delta > 0:
                     verdict = "已确认积分增长（自审通过）"
-                elif not UNFINISHED:
+                elif not run_state.unfinished:
                     verdict = "余额未变化：任务标记完成但积分未增（可能延迟入账或已于昨日计入）"
                 else:
                     verdict = "既有未完成任务、余额也未增长，疑似选择器失效或风控，需人工排查"
@@ -384,8 +386,8 @@ def _build_mail_body(failed, error=""):
                 head += f"\n[积分自审] 运行前 {pb} -> 运行后 {pa}（仅一端读数成功，无法计算差额）"
     except Exception:  # noqa: BLE001
         pass
-    if DAILY_SET_RESULT is not None:
-        ds = DAILY_SET_RESULT
+    if run_state.daily_set_result is not None:
+        ds = run_state.daily_set_result
         head += f"\n[每日活动] 完成 {ds.get('done')}/{ds.get('total')} 张，本次领取奖励积分 {ds.get('claimed')}"
     return f"{head}\n\n----- 本次运行日志末尾 -----\n{tail}\n"
 
@@ -404,12 +406,12 @@ def _notify_mail(failed, error=""):
     if state.get(status) == today:
         print(f"[邮件] 今日 {status} 邮件已发送过，跳过重复通知。")
         return
-    tag = "失败" if failed else (f"部分未完成({len(UNFINISHED)})" if UNFINISHED else "成功")
+    tag = "失败" if failed else (f"部分未完成({len(run_state.unfinished)})" if run_state.unfinished else "成功")
     subject = f"微软积分自动任务 {time.strftime('%Y-%m-%d %H:%M')} - {tag}"
     body = _build_mail_body(failed, error)
-    if STRUCTURAL_FAILURES:
+    if run_state.structural_failures:
         body += "\n[结构异常]\n"
-        body += "\n".join(f"  · {s}" for s in STRUCTURAL_FAILURES)
+        body += "\n".join(f"  · {s}" for s in run_state.structural_failures)
         body += "\n\n这通常意味着页面结构 / 识别键已变化，脚本可能整月零完成而未被发现。"
         body += "\n请检查 is_monthly_strategy 识别键是否仍匹配当前页面（见 ADR-0002）。"
     if send_mail(subject, body):
@@ -427,6 +429,16 @@ PROFILE_DIR = r"F:\AI\tasks\auto-sign\microsoft\edge_profile"
 EARN_URL = "https://rewards.bing.com/earn"
 DASHBOARD_URL = "https://rewards.bing.com/dashboard"
 HEADLESS = False  # 必须非无头，才能复用桌面登录态并观察
+
+# D3：DOM 选择器「单一真相源」——href 特征 / CSS 类名集中于此，Python 侧一律引用本常量，
+# 杜绝 EARN/周扫描等 6 处各自写死。内嵌 JS 的 page.evaluate() 周任务扫描器保持原样
+# （r-string 含大量 `{}`，转 f-string 会破坏对象字面量），见周扫描处注释说明如何对齐。
+SELECTORS = {
+    "SEARCH_HREF": "bing.com/search",         # 搜索任务链接 href 特征（classify_offer / 跳转搜索）
+    "STATUS_OK": "statusSuccessRewardsBg",    # 完成绿勾徽章类（周任务 / 活动判定）
+    "DS_CARD": "a[href*='DailySet']",         # DailySet 兜底卡片
+    "A_TARGET": "a[data-offer-target='1']",   # click_offer 真人点击前打标的 <a>
+}
 
 
 # ====================== NAS / 无头模式 ======================
@@ -569,6 +581,15 @@ def rand(a: float = 0.4, b: float = 1.2) -> float:
     return random.uniform(a, b)
 
 
+async def human_pause(a: float = 0.4, b: float = 1.2) -> None:
+    """D5:统一『人性化等待』——等价 asyncio.sleep(rand(a,b))，风控/阅读节奏集中在这，
+    便于整体调抖动区间，避免 54 处各自拍脑袋。调用方只需表达"等 lo~hi 秒"。"""
+    await asyncio.sleep(rand(a, b))
+
+# 注：human_pause 是 54 处 asyncio.sleep(rand(...)) 的统一出口，
+# 其函数体必须保持 asyncio.sleep(rand(a,b)) 原样（勿被 replace_all 改写成自调用）。
+
+
 # Playwright 的 Mouse 对象未暴露「当前坐标」，需自行在 page 上维护一份状态。
 def _get_mouse_pos(page: Page) -> dict:
     pos = getattr(page, "_mm_pos", None)
@@ -614,7 +635,7 @@ async def move_mouse_human(page: Page, tx: float, ty: float):
 async def click_human(page: Page, locator: Locator):
     """滚动到元素 -> 曲线移动 -> 随机短暂停顿 -> 点击"""
     await locator.scroll_into_view_if_needed()
-    await asyncio.sleep(rand(0.3, 0.7))
+    await human_pause(0.3, 0.7)
     box = await locator.bounding_box()
     if not box:
         raise RuntimeError("元素无包围盒，无法点击: " + await locator.to_string() if hasattr(locator, "to_string") else str(locator))
@@ -622,10 +643,10 @@ async def click_human(page: Page, locator: Locator):
     cx = box["x"] + box["width"] * random.uniform(0.3, 0.7)
     cy = box["y"] + box["height"] * random.uniform(0.35, 0.65)
     await move_mouse_human(page, cx, cy)
-    await asyncio.sleep(rand(0.1, 0.35))
+    await human_pause(0.1, 0.35)
     await page.mouse.click(cx, cy)
     _set_mouse_pos(page, cx, cy)
-    await asyncio.sleep(rand(0.3, 0.9))
+    await human_pause(0.3, 0.9)
 
 
 async def perform_search(context: BrowserContext):
@@ -633,17 +654,17 @@ async def perform_search(context: BrowserContext):
     page = await context.new_page()
     try:
         await page.goto("https://www.bing.com", wait_until="domcontentloaded")
-        await asyncio.sleep(rand(1.0, 2.0))
+        await human_pause(1.0, 2.0)
         box = await page.locator("#sb_form_q").bounding_box()
         if box:
             await click_human(page, page.locator("#sb_form_q"))
             q = random.choice(SEARCH_QUERIES)
             await page.keyboard.type(q, delay=random.uniform(60, 160))
-            await asyncio.sleep(rand(0.3, 0.8))
+            await human_pause(0.3, 0.8)
             await page.keyboard.press("Enter")
-            await asyncio.sleep(rand(2.5, 4.5))
+            await human_pause(2.5, 4.5)
     finally:
-        await asyncio.sleep(rand(0.5, 1.5))
+        await human_pause(0.5, 1.5)
         await page.close()
 
 
@@ -659,7 +680,7 @@ async def dismiss_edge_sync_prompt(context: BrowserContext):
                 if await btn.count() > 0 and await btn.is_visible(timeout=2000):
                     print(f"[同步] 检测到 Edge 同步提示，点击「{kw}」关闭")
                     await btn.click(timeout=3000)
-                    await asyncio.sleep(rand(0.8, 1.5))
+                    await human_pause(0.8, 1.5)
                     return
             except Exception:
                 continue
@@ -671,9 +692,9 @@ async def perform_search_on_page(page: Page):
         return
     await click_human(page, page.locator("#sb_form_q"))
     await page.keyboard.type(random.choice(SEARCH_QUERIES), delay=random.uniform(60, 160))
-    await asyncio.sleep(rand(0.3, 0.8))
+    await human_pause(0.3, 0.8)
     await page.keyboard.press("Enter")
-    await asyncio.sleep(rand(2.5, 4.5))
+    await human_pause(2.5, 4.5)
 
 
 async def skip_puzzle(page: Page):
@@ -681,7 +702,7 @@ async def skip_puzzle(page: Page):
     skip = page.locator("text=跳过拼图, text=跳过, text=SKIP").first
     if await skip.count() > 0:
         await click_human(page, skip)
-        await asyncio.sleep(rand(1.0, 2.0))
+        await human_pause(1.0, 2.0)
 
 
 async def handle_quiz(np: Page):
@@ -691,14 +712,14 @@ async def handle_quiz(np: Page):
     每轮点击一个候选答案，重复若干轮直到没有可点选项或达到上限。
     """
     # 先等页面/测验加载，并尝试点击「开始/开始测验」入口
-    await asyncio.sleep(rand(2.0, 3.5))
+    await human_pause(2.0, 3.5)
     for kw in ["开始测验", "开始答题", "立即开始", "开始", "START"]:
         btn = np.locator(f"text={kw}").first
         try:
             if await btn.count() > 0 and await btn.is_visible():
                 print(f"      点击「{kw}」进入测验")
                 await click_human(np, btn)
-                await asyncio.sleep(rand(1.5, 2.5))
+                await human_pause(1.5, 2.5)
                 break
         except Exception:
             continue
@@ -785,8 +806,8 @@ async def handle_quiz(np: Page):
                 print("      未发现更多可点选项，测验流程结束")
             break
         # 等本题提交/翻页（原 2-3.5s，缩短以减少冗余等待）
-        await asyncio.sleep(rand(1.5, 2.5))
-    await asyncio.sleep(rand(1.5, 2.5))  # 收尾等待（原 2-4s）
+        await human_pause(1.5, 2.5)
+    await human_pause(1.5, 2.5)  # 收尾等待（原 2-4s）
 
 
 async def _has_real_quiz_elements(np: Page) -> bool:
@@ -854,7 +875,7 @@ async def handle_puzzle_or_quiz(np: Page) -> bool:
         if await sl.count() > 0 and await sl.is_visible():
             print("      真人鼠标点击 #skipPuzzle（跳过拼图）")
             await click_human(np, sl)
-            await asyncio.sleep(rand(2.5, 4.5))
+            await human_pause(2.5, 4.5)
             skipped = True
     except Exception:
         pass
@@ -866,7 +887,7 @@ async def handle_puzzle_or_quiz(np: Page) -> bool:
                 if await btn.count() > 0 and await btn.is_visible():
                     print(f"      点击「{kw}」")
                     await click_human(np, btn)
-                    await asyncio.sleep(rand(2.0, 4.0))
+                    await human_pause(2.0, 4.0)
                     skipped = True
                     break
             except Exception:
@@ -880,7 +901,7 @@ async def handle_puzzle_or_quiz(np: Page) -> bool:
                 if await btn.count() > 0 and await btn.is_visible():
                     print(f"      点击「{kw}」进入")
                     await click_human(np, btn)
-                    await asyncio.sleep(rand(1.5, 2.5))
+                    await human_pause(1.5, 2.5)
                     break
             except Exception:
                 continue
@@ -908,14 +929,14 @@ async def handle_puzzle_or_quiz(np: Page) -> bool:
                 _set_mouse_pos(np, cx, cy)
         except Exception:
             pass
-        await asyncio.sleep(rand(1.0, 2.0))
+        await human_pause(1.0, 2.0)
         for kw in ["跳过拼图", "跳过", "Skip"]:
             btn = np.locator(f"text={kw}").first
             try:
                 if await btn.count() > 0 and await btn.is_visible():
                     print(f"      点击「{kw}」")
                     await click_human(np, btn)
-                    await asyncio.sleep(rand(1.5, 3.0))
+                    await human_pause(1.5, 3.0)
                     skipped = True
                     break
             except Exception:
@@ -923,7 +944,7 @@ async def handle_puzzle_or_quiz(np: Page) -> bool:
     if not skipped:
         print("      ⚠ 未找到「跳过拼图」入口")
     # 留出积分入账时间（关闭由调用方执行）
-    await asyncio.sleep(rand(2.0, 4.0))
+    await human_pause(2.0, 4.0)
     return True
 
 
@@ -965,7 +986,7 @@ def classify_offer(href: str) -> str:
         return "quiz"
     if "/quest/" in low or "punchcard" in low:
         return "punchcard"
-    if "bing.com/search" in low:
+    if SELECTORS["SEARCH_HREF"] in low:
         return "search"
     return "other"
 
@@ -1006,17 +1027,14 @@ async def click_offer(page: Page, href: str, source_url: str = EARN_URL):
     }""", href)
     if info is None:
         return None, False, "no-link"
-    link = page.locator('a[data-offer-target="1"]').first
+    link = page.locator(SELECTORS["A_TARGET"]).first
     tb = info["tb"]
     if "blank" in tb:
-        try:
-            async with page.expect_popup(timeout=8000) as pi:
-                await safe_click(page, link)
-            popup = await pi.value
+        # D2：复用统一弹出原语（expect_popup + 真人点击），不重复内联 expect_popup
+        popup = await click_link_get_popup(page, link)
+        if popup is not None:
             await popup.wait_for_load_state("domcontentloaded")
             return popup, False, None
-        except Exception:
-            pass
     # 同页跳转
     try:
         await safe_click(page, link)
@@ -1043,7 +1061,7 @@ async def click_offer(page: Page, href: str, source_url: str = EARN_URL):
 
 async def handle_punchcard(page: Page):
     """打卡/任务集页面：点击「继续/开始/领取」等按钮（best-effort），留存积分入账时间。"""
-    await asyncio.sleep(rand(2.0, 3.0))
+    await human_pause(2.0, 3.0)
     for kw in ["继续", "开始", "领取", "领取积分", "立即开始", "参与", "去完成"]:
         for _ in range(3):
             btn = page.locator(f"text={kw}").first
@@ -1051,10 +1069,10 @@ async def handle_punchcard(page: Page):
                 if await btn.count() > 0 and await btn.is_visible():
                     print(f"      点击「{kw}」")
                     await safe_click(page, btn)
-                    await asyncio.sleep(rand(1.5, 2.5))
+                    await human_pause(1.5, 2.5)
             except Exception:
                 continue
-    await asyncio.sleep(rand(2.0, 4.0))
+    await human_pause(2.0, 4.0)
 
 
 async def _snapshot(target: Page, name: str):
@@ -1076,11 +1094,11 @@ async def _snapshot(target: Page, name: str):
 
 async def run_offer(target: Page, href: str, typ: str):
     """在真正的任务页上按类型完成交互。target 是弹出页或已跳转的当前页。"""
-    await asyncio.sleep(rand(1.5, 2.5))
+    await human_pause(1.5, 2.5)
     await _snapshot(target, typ)  # 落页即存快照，便于后续精修拼图/问答选择器
     if typ == "search":
         # 带奖励参数的搜索页载入即计分，静候入账
-        await asyncio.sleep(rand(5.0, 9.0))
+        await human_pause(5.0, 9.0)
         # 极少数「每日活动」的 bing.com/search 链接内嵌真实问答(quiz)，需逐题点选；
         # 但必应搜索结果页本身不是 quiz——只有页面真含问答容器时才处理，
         # 避免把普通搜索页误当 quiz 去点选答案（用户实测：『探索阿马尔菲』『即将举行的体育赛事』等）。
@@ -1106,11 +1124,11 @@ async def run_offer(target: Page, href: str, typ: str):
             if await handle_puzzle_or_quiz(target):
                 print("    other 页识别为问答/拼图，已执行交互流程")
             else:
-                await asyncio.sleep(rand(3.0, 5.0))
+                await human_pause(3.0, 5.0)
         except Exception as e:
             print(f"    other 页问答补充处理异常: {e}")
-            await asyncio.sleep(rand(3.0, 5.0))
-    await asyncio.sleep(rand(2.0, 4.0))
+            await human_pause(3.0, 5.0)
+    await human_pause(2.0, 4.0)
 
 
 async def task_dashboard_activities(page: Page, context: BrowserContext):
@@ -1174,7 +1192,7 @@ async def task_dashboard_activities(page: Page, context: BrowserContext):
                     await target.close()
                 except Exception:
                     pass
-        await asyncio.sleep(rand(1.5, 3.0))
+        await human_pause(1.5, 3.0)
     print("    其它 dashboard 任务处理完成（每日活动由 task_dashboard_daily_set 专项处理）")
 
 
@@ -1217,13 +1235,13 @@ async def task_dashboard_daily_set(page: Page, context: BrowserContext = None, l
     cards = []
     if panel is not None:
         try:
-            cards = await panel.locator("a[href*='bing.com/search']").all()
+            cards = await panel.locator(f"a[href*='{SELECTORS['SEARCH_HREF']}']").all()
         except Exception:
             cards = []
     if not cards:
         # 兜底：整页直接找 DailySet 卡片
         try:
-            cards = await page.locator("a[href*='DailySet']").all()
+            cards = await page.locator(SELECTORS["DS_CARD"]).all()
         except Exception:
             cards = []
 
@@ -1391,20 +1409,20 @@ async def task_monthly_strategy(page: Page, context: BrowserContext):
             break
     if card is None:
         print("    未找到本月攻略卡片（定位器零匹配）——结构级异常，已计入告警")
-        STRUCTURAL_FAILURES.append(
+        run_state.structural_failures.append(
             "本月攻略定位器整月零匹配：is_monthly_strategy 在 earn 页未找到任何本月攻略卡片"
         )
         return
     popup = await click_link_get_popup(page, card)
     if popup is not None:
         await popup.wait_for_load_state("domcontentloaded")
-        await asyncio.sleep(rand(2.5, 4.5))
+        await human_pause(2.5, 4.5)
         target = popup
         print("    已进入本月攻略 punchcard 详情（新标签）")
     else:
         # 同页跳转：当前页即为详情页；若点击未触发导航则回退 goto
         target = page
-        await asyncio.sleep(rand(2.5, 4.5))
+        await human_pause(2.5, 4.5)
         if "/quest/" not in page.url and july_href:
             print("    同页未跳转，回退 goto 进入本月攻略详情")
             try:
@@ -1513,7 +1531,7 @@ async def task_monthly_strategy(page: Page, context: BrowserContext):
         if blockers:
             for b in blockers:
                 print(f"    ⚠ 开放周「{b['title'][:30]}」href 提取失败，本轮无法点击，已记入复检清单")
-                UNFINISHED.append(f"{b['title'][:40]}  [周前往链接提取失败/为空]")
+                run_state.unfinished.append(f"{b['title'][:40]}  [周前往链接提取失败/为空]")
         print(f"    其中未勾选且非锁定的开放周：{len(uniq)} 个（可合法点击 {len(doable)}，待排查 {len(blockers)}）")
         for r in doable:
             if not week_gate_ok(r["title"]):
@@ -1527,15 +1545,10 @@ async def task_monthly_strategy(page: Page, context: BrowserContext):
             if await link.count() > 0:
                 sp = await click_link_get_popup(target, link)  # 内部 expect_popup(8000) + 真人点击
             if sp is None:
-                # 回退 1：宽松选择器 + 更长超时
-                link2 = target.locator('a[href*="bing.com/search"]').first
+                # 回退 1：宽松选择器 + 更长超时（复用统一弹出原语，放宽到 15s）
+                link2 = target.locator(f'a[href*="{SELECTORS["SEARCH_HREF"]}"]').first
                 if await link2.count() > 0:
-                    try:
-                        async with target.expect_popup(timeout=15000) as pi:
-                            await click_human(target, link2)
-                        sp = await pi.value
-                    except Exception:
-                        sp = None
+                    sp = await click_link_get_popup(target, link2, timeout=15000)
             if sp is not None:
                 # 真实弹出搜索页（保留从 Rewards 点击的上下文，微软才正确计分）
                 try:
@@ -1554,7 +1567,7 @@ async def task_monthly_strategy(page: Page, context: BrowserContext):
                     await np.close()
             # 单周完成闭环校验：reload punchcard 页再扫一次，确认该周绿勾翻转
             # 区分「点击了但微软不计分」与「压根没点到」，对应 ADR-0002 的涨分自审思路
-            await asyncio.sleep(rand(1.5, 3.0))
+            await human_pause(1.5, 3.0)
             try:
                 await target.reload(wait_until="domcontentloaded")
                 await target.wait_for_timeout(4000)
@@ -1654,7 +1667,7 @@ async def process_offers(page: Page, context: BrowserContext):
         if popup is not None:
             try:
                 await popup.wait_for_load_state("domcontentloaded")
-                await asyncio.sleep(rand(2.0, 3.5))
+                await human_pause(2.0, 3.5)
                 await run_offer(popup, o["href"], typ)
             except Exception as e:
                 print(f"    任务处理异常: {e}")
@@ -1667,7 +1680,7 @@ async def process_offers(page: Page, context: BrowserContext):
             # 未弹出新标签（同页跳转）：在当前页处理后回退 earn
             print("    未弹出新标签，尝试同页处理并回退")
             try:
-                await asyncio.sleep(rand(2.0, 3.5))
+                await human_pause(2.0, 3.5)
                 await run_offer(page, o["href"], typ)
             except Exception as e:
                 print(f"    同页处理异常: {e}")
@@ -1676,7 +1689,7 @@ async def process_offers(page: Page, context: BrowserContext):
                 await page.wait_for_timeout(3000)
             except Exception:
                 pass
-        await asyncio.sleep(rand(1.5, 3.0))
+        await human_pause(1.5, 3.0)
     print("    全部任务处理完成")
 
 
@@ -1736,14 +1749,14 @@ async def find_card_by_keyword(page: Page, keyword: str) -> Locator | None:
 async def click_card_open_flyout(page: Page, card: Locator):
     """点击卡片打开右侧栏；若未弹出，则尝试点击卡片内的「开始/继续」等按钮。"""
     await click_human(page, card)
-    await asyncio.sleep(rand(1.0, 2.0))
+    await human_pause(1.0, 2.0)
     if await find_flyout(page) is None:
         for label in ["开始", "继续", "立即开始", "了解更多", "去完成", "参与", "立即参与"]:
             btn = card.locator("a,button").filter(has_text=label).first
             if await btn.count() > 0:
                 try:
                     await click_human(page, btn)
-                    await asyncio.sleep(rand(1.0, 2.0))
+                    await human_pause(1.0, 2.0)
                     break
                 except Exception:
                     continue
@@ -1764,15 +1777,17 @@ async def find_flyout(page: Page) -> Locator | None:
     return None
 
 
-async def click_link_get_popup(page: Page, link: Locator) -> Page | None:
+async def click_link_get_popup(page: Page, link: Locator, timeout: int = 8000) -> Page | None:
     """真人鼠标点击一个链接/卡片元素，返回它弹出的新标签页（无则 None）。
 
-    这是「模仿真人从 Rewards 页点击卡片」的核心：保留点击上下文，
-    微软才会正确计分（直接 goto href 会脱离上下文导致不计分）。
+    这是「模仿真人从 Rewards 页点击卡片」的**唯一弹出原语**（D2）：
+    EARN 点击 / 周任务跳转 / 兜底重试都复用本函数，内部 expect_popup + 真人点击，
+    不再各写各的 expect_popup。timeout 供特殊场景（宽松兜底）放宽到 15s。
+    保留点击上下文，微软才会正确计分（直接 goto href 会脱离上下文导致不计分）。
     """
     popup = None
     try:
-        async with page.expect_popup(timeout=8000) as pi:
+        async with page.expect_popup(timeout=timeout) as pi:
             await click_human(page, link)
         popup = await pi.value
     except Exception:
@@ -1784,11 +1799,11 @@ async def process_task_page(target: Page, href: str, is_search: bool):
     """在任务页（弹出的新标签页或当前页）上完成交互并等待积分入账。"""
     if is_search:
         # 带奖励参数的搜索页「载入即计分」，切勿再输入词/回车，静候入账
-        await asyncio.sleep(rand(5.0, 9.0))
+        await human_pause(5.0, 9.0)
     else:
         # 拼图/问题页：真人点击 -> 跳过 -> （由调用方关闭）
         await handle_puzzle_or_quiz(target)
-    await asyncio.sleep(rand(2.0, 4.0))
+    await human_pause(2.0, 4.0)
 
 
 # ====================== 任务实现 ======================
@@ -1834,7 +1849,7 @@ async def task_search_card(page: Page, context: BrowserContext):
     # 点卡片 -> 右侧栏 -> 真人点击搜索跳转链接（保留上下文，正确计分）
     before = set(await collect_hrefs(page))
     await click_card_open_flyout(page, card)
-    await asyncio.sleep(rand(1.5, 2.5))
+    await human_pause(1.5, 2.5)
     flyout = await find_flyout(page)
     hrefs = await collect_hrefs(flyout) if flyout is not None else []
     if not hrefs:
@@ -1849,20 +1864,20 @@ async def task_search_card(page: Page, context: BrowserContext):
     if popup is not None:
         try:
             await popup.wait_for_load_state("domcontentloaded")
-            await asyncio.sleep(rand(2.0, 4.0))
+            await human_pause(2.0, 4.0)
             if await popup.locator("#sb_form_q").count() > 0:
                 await perform_search_on_page(popup)
-            await asyncio.sleep(rand(3.0, 5.0))
+            await human_pause(3.0, 5.0)
         finally:
             await popup.close()
     else:
         np = await context.new_page()
         try:
             await np.goto(link, wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(rand(2.0, 4.0))
+            await human_pause(2.0, 4.0)
             if await np.locator("#sb_form_q").count() > 0:
                 await perform_search_on_page(np)
-            await asyncio.sleep(rand(3.0, 5.0))
+            await human_pause(3.0, 5.0)
         finally:
             await np.close()
     print("    完成一次搜索，期望显示 搜索: 1/1")
@@ -1979,7 +1994,7 @@ async def verify_and_retry(page: Page, context: BrowserContext):
     动机：任务是否做成不能靠 classify_offer 按 href 猜（曾把内嵌问答的
     bing.com/search 链接当成「载入即计分」而只 sleep，导致该活动一直没完成）。
     这里跑完所有流程后重新扫描一次，凡是页面仍未标记完成的就再跑一轮；
-    仍未完成的写入 UNFINISHED，由结果邮件直接告知，不必人工比对网页。
+    仍未完成的写入 run_state.unfinished，由结果邮件直接告知，不必人工比对网页。
     """
     print("[✓] 收尾复检：重新扫描未完成任务 ...")
     # 先把「每日活动」三张卡片 +「可领取」奖励积分做完（含完成校验与领取），
@@ -1989,7 +2004,7 @@ async def verify_and_retry(page: Page, context: BrowserContext):
     except Exception as e:
         print(f"  ✗ 复检-每日活动专处理异常: {e}")
     remain = await _scan_unfinished(page)
-    UNFINISHED.clear()
+    run_state.unfinished.clear()
     if not remain:
         print("    复检通过：页面上所有任务均已标记完成")
         return
@@ -2031,13 +2046,13 @@ async def verify_and_retry(page: Page, context: BrowserContext):
                         pass
         except Exception as e:
             print(f"    重试异常：{e}")
-        await asyncio.sleep(rand(1.5, 3.0))
+        await human_pause(1.5, 3.0)
     # 二次复检：仍未完成的记入邮件清单（只报不再重试，避免风控与死循环）
     still = await _scan_unfinished(page)
-    UNFINISHED.extend(f"{o['text'][:40]}  [{o['href'][:70]}]" for o in still)
-    if UNFINISHED:
-        print(f"    ⚠ 重试后仍有 {len(UNFINISHED)} 项未完成，将写入结果邮件：")
-        for t in UNFINISHED:
+    run_state.unfinished.extend(f"{o['text'][:40]}  [{o['href'][:70]}]" for o in still)
+    if run_state.unfinished:
+        print(f"    ⚠ 重试后仍有 {len(run_state.unfinished)} 项未完成，将写入结果邮件：")
+        for t in run_state.unfinished:
             print(f"      · {t}")
     else:
         print("    重试后全部完成")
@@ -2150,7 +2165,7 @@ async def read_available_points(page):
 
 async def main():
     _install_log()
-    global POINTS_BEFORE, POINTS_AFTER
+    global HEADLESS
     if IS_NAS:
         # NAS / 无头模式：跳过 Windows 专属步骤，使用 Chromium + storage_state
         global HEADLESS
@@ -2213,8 +2228,8 @@ async def main():
 
             # 积分自审：记录运行前「可用积分」余额（best-effort，失败不影响流程）
             try:
-                POINTS_BEFORE = await read_available_points(page)
-                print(f"[积分自审] 运行前可用积分：{POINTS_BEFORE}")
+                run_state.points_before = await read_available_points(page)
+                print(f"[积分自审] 运行前可用积分：{run_state.points_before}")
             except Exception as e:  # noqa: BLE001
                 print(f"  [积分自审] 运行前读数失败（已忽略）：{e}")
 
@@ -2223,34 +2238,33 @@ async def main():
                 await task_dashboard_activities(page, context)
             except Exception as e:
                 print(f"  ✗ 活动打卡执行异常: {e}")
-            await asyncio.sleep(rand(1.0, 2.0))
+            await human_pause(1.0, 2.0)
             # 每日活动三张卡片：专门处理（逐卡校验「已完成」+ 领取「可领取」奖励积分）
             try:
-                global DAILY_SET_RESULT
-                DAILY_SET_RESULT = await task_dashboard_daily_set(page, context)
-                print(f"[每日活动] 完成 {DAILY_SET_RESULT['done']}/{DAILY_SET_RESULT['total']} 张，"
-                      f"本次领取奖励积分 {DAILY_SET_RESULT['claimed']}")
+                run_state.daily_set_result = await task_dashboard_daily_set(page, context)
+                print(f"[每日活动] 完成 {run_state.daily_set_result['done']}/{run_state.daily_set_result['total']} 张，"
+                      f"本次领取奖励积分 {run_state.daily_set_result['claimed']}")
             except Exception as e:
                 print(f"  ✗ 每日活动专处理异常: {e}")
-            await asyncio.sleep(rand(1.0, 2.0))
+            await human_pause(1.0, 2.0)
             # 统一处理：直接在 earn 页面按真实任务链接真人点击（不再依赖卡片容器）
             try:
                 await process_offers(page, context)
             except Exception as e:
                 print(f"  ✗ 任务执行异常: {e}")
-            await asyncio.sleep(rand(1.0, 2.0))
+            await human_pause(1.0, 2.0)
             # 必应搜索连续打卡（搜索: 0/1）：需真实搜索一次才计分，专门处理
             try:
                 await task_search_card(page, context)
             except Exception as e:
                 print(f"  ✗ 必应搜索执行异常: {e}")
-            await asyncio.sleep(rand(1.0, 2.0))
+            await human_pause(1.0, 2.0)
             # 本月攻略：4 周子任务，绿勾跳过、无勾点击
             try:
                 await task_monthly_strategy(page, context)
             except Exception as e:
                 print(f"  ✗ 本月攻略执行异常: {e}")
-            await asyncio.sleep(rand(1.0, 2.0))
+            await human_pause(1.0, 2.0)
             # 收尾复检：以页面「已完成」标记为准，漏做的自动重试一轮并写入邮件
             try:
                 await verify_and_retry(page, context)
@@ -2259,15 +2273,14 @@ async def main():
 
             # 积分自审：记录运行后「可用积分」余额（确认本次是否真的涨分）
             try:
-                POINTS_AFTER = await read_available_points(page)
-                print(f"[积分自审] 运行后可用积分：{POINTS_AFTER}")
+                run_state.points_after = await read_available_points(page)
+                print(f"[积分自审] 运行后可用积分：{run_state.points_after}")
             except Exception as e:  # noqa: BLE001
                 print(f"  [积分自审] 运行后读数失败（已忽略）：{e}")
 
             print("全部任务执行完毕。")
         except Exception as e:
-            global LAST_RUN_FAILED
-            LAST_RUN_FAILED = True
+            run_state.last_run_failed = True
             print("主流程异常:", e)
             try:
                 await page.screenshot(path="debug_error.png", full_page=True)
@@ -2329,9 +2342,9 @@ if __name__ == "__main__":
         try:
             asyncio.run(main())
         except BaseException as e:
-            LAST_RUN_FAILED = True
+            run_state.last_run_failed = True
             traceback.print_exc()
             _notify_mail(failed=True, error=str(e))
             raise
         else:
-            _notify_mail(failed=LAST_RUN_FAILED, error="")
+            _notify_mail(failed=run_state.last_run_failed, error="")
