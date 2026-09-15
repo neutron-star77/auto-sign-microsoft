@@ -1,0 +1,46 @@
+# ===== 敏感文件（永不入库）=====
+# 微软登录态 cookie，一旦入库即泄露，必须永久忽略
+storage_state.json
+# SSH 公钥 seed，含认证材料
+authorized_keys_seed.txt
+# 若本地生成了真实配置（示例为 config.example.json 才入库）
+config.json
+
+# ===== 运行态 / 状态 / 调度生成物 =====
+data/
+edge_profile/
+.codebuddy/
+# 遗留暂存/部署杂项（非微软积分业务）
+1/
+*.log
+run_*.log
+*.session
+monthly_state.json
+weekly_click_state.json
+schedule.txt
+disabled.flag
+*.lock
+.run.lock
+.schedule.lock
+manual_run.state
+verify_err.txt
+verify_out.txt
+
+# ===== 调试 / 截图 / 页面快照 =====
+dbg_*.html
+*.png
+
+# ===== 本地备份（回滚点，不入库）=====
+*.bak
+*.bak.*
+.bak/
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+
+# ===== 编辑器 / 系统 =====
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
