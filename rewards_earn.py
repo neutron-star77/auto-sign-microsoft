@@ -719,6 +719,8 @@ def cleanup_locks():
     candidates = [
         os.path.join(base, "lockfile"),
         os.path.join(base, "SingletonLock"),
+        os.path.join(base, "SingletonCookie"),
+        os.path.join(base, "SingletonSocket"),
         os.path.join(base, "Default", "lockfile"),
         os.path.join(base, "Default", "SingletonLock"),
     ]
@@ -2507,7 +2509,18 @@ async def export_storage_state():
                 if "ERR_ABORTED" not in str(first_error):
                     raise
                 print(f"[导出] 首次导航被 Edge 中断（ERR_ABORTED），等待后重试：{page.url}")
-                await page.wait_for_timeout(3000)
+                # ERR_ABORTED 可能同时关闭原始 about:blank page，不能继续复用它。
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+                try:
+                    page = await context.new_page()
+                except Exception as retry_error:
+                    raise VerificationError(
+                        "EXPORT_EDGE_CLOSED: Edge 在首次导航后关闭了导出页面。"
+                        "请确认所有 Edge 窗口已关闭后重试。"
+                    ) from retry_error
                 response = await page.goto(EARN_URL, wait_until="commit", timeout=120000)
                 try:
                     await page.wait_for_load_state("domcontentloaded", timeout=30000)
