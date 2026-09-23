@@ -2499,7 +2499,20 @@ async def export_storage_state():
         )
         try:
             page = context.pages[0] if context.pages else await context.new_page()
-            response = await page.goto(EARN_URL, wait_until="domcontentloaded", timeout=120000)
+            try:
+                response = await page.goto(EARN_URL, wait_until="domcontentloaded", timeout=120000)
+            except Exception as first_error:
+                # Edge 首次启动时可能因初始空白页/扩展重定向竞争返回 ERR_ABORTED；
+                # 先等待当前导航落地，再用 commit 导航重试，避免把可恢复中断当成登录失败。
+                if "ERR_ABORTED" not in str(first_error):
+                    raise
+                print(f"[导出] 首次导航被 Edge 中断（ERR_ABORTED），等待后重试：{page.url}")
+                await page.wait_for_timeout(3000)
+                response = await page.goto(EARN_URL, wait_until="commit", timeout=120000)
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=30000)
+                except Exception:
+                    print(f"[导出] 重试后页面仍在加载，当前 URL：{_display_url(page.url)}，继续诊断。")
             await page.wait_for_timeout(5000)
             if _is_auth_wall_url(page.url):
                 print("⚠ 跳转到登录/重新认证页面，请手动完成登录或账户条款确认后回到此处按 Enter。")
