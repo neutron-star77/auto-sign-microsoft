@@ -19,10 +19,12 @@ import sys
 import time
 import json
 import traceback
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
+from urllib.parse import urlsplit, urlunsplit
 
-from playwright.async_api import async_playwright, BrowserContext, Page, Locator
+from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Locator
 
 
 # ====================== 运行日志文件 ======================
@@ -458,6 +460,164 @@ EXPORT_STATE_PATH = os.environ.get(
 )
 
 
+class AuthenticationRequired(RuntimeError):
+    """登录态失效、被重新认证或被 Microsoft 登录墙拦截。"""
+
+    def __init__(self, message: str, code: str = "AUTH_REQUIRED"):
+        self.code = code
+        super().__init__(f"{code}: {message}")
+
+
+class StorageStateError(RuntimeError):
+    """storage_state.json 不是可供 Playwright 使用的状态文件。"""
+
+
+class VerificationError(RuntimeError):
+    """复检缺少可信页面数据，不能断言任务完成。"""
+
+
+AUTH_WALL_HOSTS = {
+    "account.live.com",
+    "login.live.com",
+    "login.microsoftonline.com",
+    "login.microsoft.com",
+}
+
+
+def _is_auth_wall_url(url: str) -> bool:
+    """判断当前 URL 是否已离开 Rewards，进入登录/重新认证流程。"""
+    try:
+        parsed = urlsplit(url or "")
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower()
+    path = (parsed.path or "").lower()
+    if host in AUTH_WALL_HOSTS:
+        return True
+    return host == "rewards.bing.com" and path.startswith(("/login", "/signin"))
+
+
+def _display_url(url: str) -> str:
+    """日志中只保留 URL 的 origin/path，避免把认证查询参数写入日志或邮件。"""
+    try:
+        parsed = urlsplit(url or "")
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+    except ValueError:
+        return (url or "").split("?", 1)[0].split("#", 1)[0]
+
+
+def _read_storage_state(path) -> dict:
+    """读取并校验 Playwright storage state，保留 cookies 与 origins。"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    except (OSError, ValueError) as e:
+        raise StorageStateError(
+            f"AUTH_IMPORT_INVALID: 无法读取 storage_state：{path}。"
+            "请执行 `python rewards_earn.py export` 并更新 NAS 的 data/storage_state.json。"
+        ) from e
+    if not isinstance(state, dict):
+        raise StorageStateError(f"storage_state 顶层必须是对象：{path}")
+    if not isinstance(state.get("cookies"), list):
+        raise StorageStateError(f"storage_state.cookies 必须是数组：{path}")
+    if "origins" in state and not isinstance(state["origins"], list):
+        raise StorageStateError(f"storage_state.origins 必须是数组：{path}")
+    state.setdefault("origins", [])
+    return state
+
+
+def _auth_failure_message(url: str) -> str:
+    target = _display_url(url)
+    if "/tou/" in target.lower():
+        detail = "Microsoft 要求重新确认账户条款或重新认证"
+    else:
+        detail = "Microsoft 登录态已失效或需要重新登录"
+    return (
+        f"{detail}，当前页面为 {target}。"
+        f"请在 Windows 执行 `python rewards_earn.py export`，"
+        f"并将新的 storage_state.json 覆盖到 {NAS_STORAGE_STATE}。"
+    )
+
+
+def _auth_error(url: str) -> AuthenticationRequired:
+    target = _display_url(url).lower()
+    code = "TOU_REQUIRED" if "/tou/" in target else "AUTH_EXPIRED"
+    return AuthenticationRequired(_auth_failure_message(url), code=code)
+
+
+async def _require_rewards_page(page: Page, response=None) -> None:
+    """页面位于 Rewards 且没有认证/挑战/HTTP 错误，才允许继续采集。"""
+    if _is_auth_wall_url(page.url):
+        raise _auth_error(page.url)
+    parsed = urlsplit(page.url)
+    if (parsed.hostname != "rewards.bing.com" or
+            parsed.path.rstrip("/") not in ("/earn", "/dashboard", "/rewards/dashboard")):
+        raise AuthenticationRequired(
+            f"未进入 Rewards 任务页：{_display_url(page.url)}，请检查重定向或重新导出登录态。",
+            code="UNKNOWN_REDIRECT",
+        )
+    if response is not None and response.status >= 400:
+        raise VerificationError(f"VERIFY_HTTP_ERROR: Rewards 返回 HTTP {response.status}")
+    body = (await page.locator("body").inner_text(timeout=20000)).lower()
+    if any(marker in body for marker in (
+        "captcha", "验证码", "verify you are human", "人机验证", "unusual traffic",
+    )):
+        raise AuthenticationRequired("页面要求人工验证，请在 Windows 浏览器中处理。", code="CHALLENGE_REQUIRED")
+    if not body.strip():
+        raise VerificationError("VERIFY_EMPTY_PAGE: Rewards 页面没有可读内容，不能确认登录或完成状态。")
+
+
+async def _write_storage_state(context: BrowserContext, path) -> dict:
+    """先完整序列化、再原子替换；任何失败保留原文件。"""
+    state = await context.storage_state()
+    data = json.dumps(state, ensure_ascii=False).encode("utf-8")
+    target = os.path.abspath(path)
+    fd, temp_path = tempfile.mkstemp(prefix=".rewards-state-", dir=os.path.dirname(target))
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, target)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+    return state
+
+
+@dataclass
+class BrowserSession:
+    """同时持有 context 与非持久 browser，确保 NAS 状态能安全回写并完整关闭。"""
+
+    context: BrowserContext
+    browser: Browser | None = None
+    state_path: str | None = None
+    authenticated: bool = False
+
+
+async def _persist_storage_state(session: BrowserSession) -> None:
+    """认证成功后原子保存最新状态，避免中途崩溃截断正式文件。"""
+    if not session.state_path or not session.authenticated:
+        return
+    try:
+        await _write_storage_state(session.context, session.state_path)
+        print(f"    已更新 storage_state：{session.state_path}")
+    except Exception as e:
+        raise StorageStateError("AUTH_SAVE_FAILED: 无法保存续期后的登录态，原文件已保留。") from e
+
+
+async def _close_session(session: BrowserSession, persist_state: bool = False) -> None:
+    try:
+        if persist_state:
+            await _persist_storage_state(session)
+    finally:
+        try:
+            await session.context.close()
+        finally:
+            if session.browser is not None:
+                await session.browser.close()
+
+
 def preflight():
     """启动前自检：若有 Edge 残留进程，强制关闭以保证 profile 文件不被锁"""
     print("[自检] 检查 Edge 进程...")
@@ -553,7 +713,9 @@ def setup_profile(force: bool = False):
 
 def cleanup_locks():
     """清除上一次异常退出留下的锁文件，避免新启动卡死"""
-    base = NAS_PROFILE_DIR if IS_NAS else PROFILE_DIR
+    if IS_NAS:
+        return  # NAS 使用隔离 context，不再操作旧持久化 profile 的锁。
+    base = PROFILE_DIR
     candidates = [
         os.path.join(base, "lockfile"),
         os.path.join(base, "SingletonLock"),
@@ -1952,18 +2114,19 @@ def _looks_done(text: str) -> bool:
 async def _scan_unfinished(page: Page) -> list:
     """重新采集 dashboard + earn，返回页面上仍未标记完成的任务（以页面状态为准）。"""
     out, seen = [], set()
+    task_count = 0
     for url in (DASHBOARD_URL, EARN_URL):
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            response = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_timeout(3500)
-            low = page.url.lower()
-            if "login" in low or "signin" in low or "live.com" in low:
-                print(f"    ⚠ 复检 {url} 时被跳到登录页，本次复检结果不可信")
-                continue
+            await _require_rewards_page(page, response)
             raw = await collect_offers(page)
+            raw = [o for o in raw if o["text"] and not is_nav_link(o["href"])]
+            task_count += len(raw)
+        except (AuthenticationRequired, VerificationError):
+            raise
         except Exception as e:
-            print(f"    复检采集 {url} 失败：{e}")
-            continue
+            raise VerificationError(f"VERIFY_FAILED: 无法完成 {url} 的复检（{type(e).__name__}）。") from e
         for o in raw:
             if is_nav_link(o["href"]) or not o["text"]:
                 continue
@@ -1985,6 +2148,10 @@ async def _scan_unfinished(page: Page) -> list:
             seen.add(key)
             o["src"] = url
             out.append(o)
+    if task_count == 0:
+        raise VerificationError(
+            "VERIFY_NO_TASKS: dashboard 与 earn 均未识别到任务，不能判定为全部完成。"
+        )
     return out
 
 
@@ -2006,7 +2173,7 @@ async def verify_and_retry(page: Page, context: BrowserContext):
     remain = await _scan_unfinished(page)
     run_state.unfinished.clear()
     if not remain:
-        print("    复检通过：页面上所有任务均已标记完成")
+        print("    复检通过：本轮识别到的任务均已标记完成")
         return
     print(f"    复检发现 {len(remain)} 项仍未完成，开始重试：")
     retried_special = set()
@@ -2063,39 +2230,44 @@ async def verify_and_retry(page: Page, context: BrowserContext):
         print(f"  ✗ 末次-每日活动专处理异常: {e}")
 
 
-async def _launch_context(p) -> BrowserContext:
-    """按运行环境创建浏览器 context：NAS 用 Chromium 无头 + storage_state，本机用 Edge profile。"""
+async def _launch_context(p) -> BrowserSession:
+    """按运行环境创建浏览器会话；NAS 原生加载完整 storage_state。"""
     if IS_NAS:
-        print("启动 Chromium（headless，复用 storage_state 登录态）...")
-        ctx_kwargs = dict(
-            user_data_dir=NAS_PROFILE_DIR,
+        print("启动 Chromium（headless，复用完整 storage_state 登录态）...")
+        state = _read_storage_state(NAS_STORAGE_STATE)
+        if not state["cookies"]:
+            raise StorageStateError("AUTH_IMPORT_INVALID: 登录态中没有 cookies，请重新导出。")
+        print(
+            f"    载入登录态（cookies + origins）：{NAS_STORAGE_STATE} "
+            f"（{len(state['cookies'])} cookies，{len(state['origins'])} origins）"
+        )
+
+        browser = await p.chromium.launch(
             headless=True,
-            timeout=60000,  # 大 profile 启动可能较慢，给足超时
-            slow_mo=300,  # 放慢操作便于避开风控
+            timeout=60000,
+            slow_mo=300,
             args=[
                 "--no-first-run",
                 "--no-default-browser-check",
-                "--disable-dev-shm-usage",  # NAS/容器内存盘通常较小
+                "--disable-dev-shm-usage",
                 "--disable-gpu",
+                # NAS 镜像默认以 root 运行，Chromium sandbox 无法在该用户下初始化。
+                "--no-sandbox",
             ],
         )
-        # 注意：直接把 storage_state= 传给 launch_persistent_context 在部分
-        # Playwright 版本会报 “unexpected keyword argument 'storage_state'”。
-        # 改为建好 context 后再 add_cookies，跨版本兼容（与 nas_main.py 同思路）。
-        context: BrowserContext = await p.chromium.launch_persistent_context(**ctx_kwargs)
-        if os.path.exists(NAS_STORAGE_STATE):
-            try:
-                _state = json.load(open(NAS_STORAGE_STATE, encoding="utf-8"))
-                await context.add_cookies(_state.get("cookies", []))
-                print(f"    载入登录态（add_cookies）：{NAS_STORAGE_STATE}")
-            except Exception as _e:
-                print(f"    ⚠ 载入 storage_state 失败：{_e}")
-        else:
-            print(f"    ⚠ 未找到 storage_state：{NAS_STORAGE_STATE}")
-            print(f"      请在 Windows 执行 `python rewards_earn.py export` 并拷贝该文件到 NAS。")
-        return context
+        try:
+            # 原生 storage_state 同时恢复 cookies 与 origins/localStorage。
+            context = await browser.new_context(storage_state=state)
+        except BaseException:
+            await browser.close()
+            raise
+        return BrowserSession(
+            context=context,
+            browser=browser,
+            state_path=NAS_STORAGE_STATE,
+        )
     print("启动 Edge（复用登录态）...")
-    return await p.chromium.launch_persistent_context(
+    context = await p.chromium.launch_persistent_context(
         user_data_dir=PROFILE_DIR,
         channel="msedge",
         headless=HEADLESS,
@@ -2103,6 +2275,7 @@ async def _launch_context(p) -> BrowserContext:
         slow_mo=300,  # 放慢操作便于观察与避开风控
         args=["--start-maximized", "--no-first-run", "--no-default-browser-check"],
     )
+    return BrowserSession(context=context)
 
 
 async def verify_only():
@@ -2117,21 +2290,19 @@ async def verify_only():
         HEADLESS = True
     cleanup_locks()
     async with async_playwright() as p:
-        context = await _launch_context(p)
-        page = await context.new_page()
+        session = await _launch_context(p)
+        context = session.context
         try:
+            page = await context.new_page()
             remain = await _scan_unfinished(page)
             if not remain:
-                print("[复检] 页面上所有任务均已标记完成")
+                print("[复检] 本轮识别到的任务均已标记完成")
             else:
                 print(f"[复检] 仍未完成 {len(remain)} 项：")
                 for o in remain:
                     print(f"  · {o['text'][:40]}  [{o['href'][:70]}]")
         finally:
-            try:
-                await context.close()
-            except Exception:
-                pass
+            await _close_session(session)  # verify 不写登录态，不发邮件。
 
 
 async def read_available_points(page):
@@ -2168,7 +2339,6 @@ async def main():
     global HEADLESS
     if IS_NAS:
         # NAS / 无头模式：跳过 Windows 专属步骤，使用 Chromium + storage_state
-        global HEADLESS
         HEADLESS = True
         print("[模式] NAS / 无头模式（Chromium + storage_state）")
         cleanup_locks()
@@ -2178,48 +2348,42 @@ async def main():
         setup_profile(force="refresh" in sys.argv)
         cleanup_locks()
     async with async_playwright() as p:
-        context: BrowserContext = await _launch_context(p)
-        page = await context.new_page()
+        session = await _launch_context(p)
+        context = session.context
+        page = None
         try:
+            page = await context.new_page()
             # 关闭可能弹出的「登录以同步数据」首次启动提示（best-effort）
             await dismiss_edge_sync_prompt(context)
             print("正在打开:", EARN_URL)
             try:
-                await page.goto(EARN_URL, wait_until="domcontentloaded", timeout=120000)
+                response = await page.goto(EARN_URL, wait_until="domcontentloaded", timeout=120000)
             except Exception as e:
-                # 导航超时/被拦截不中止流程：打印当前状态并尝试继续
-                print("  ⚠ 首次导航未完成:", e)
-                print("    当前 URL:", page.url, "| 标题:", await page.title())
-                try:
-                    await page.screenshot(path="debug_goto.png", full_page=False)
-                    print("    已保存 debug_goto.png 以便排查")
-                except Exception:
-                    pass
+                if _is_auth_wall_url(page.url):
+                    raise _auth_error(page.url) from None
+                raise VerificationError(f"NAVIGATION_FAILED: 打开 Rewards 失败（{type(e).__name__}）。") from e
             # networkidle 在重 SPA 上易卡死，改用显式等待关键元素
             await page.wait_for_timeout(5000)
             # 导航后再次尝试关闭同步提示（部分情况下在 new-tab 页才弹出）
             await dismiss_edge_sync_prompt(context)
-            print("当前 URL:", page.url)
+            print("当前 URL:", _display_url(page.url))
             print("页面标题:", await page.title())
-            body_probe = (await page.locator("body").inner_text()).lower()
-            anti_bot_markers = ("captcha", "验证码", "verify you are human", "人机验证", "unusual traffic")
-            if any(marker in body_probe for marker in anti_bot_markers):
-                await page.screenshot(path="debug_antibot.png", full_page=True)
-                raise RuntimeError("检测到验证码/反爬拦截页面，已停止本次任务并保留 debug_antibot.png")
-            # 未登录兜底：复制的 profile 可能未携带登录态，允许手动登录一次
-            if "login" in page.url.lower() or "signin" in page.url.lower() or "live.com" in page.url.lower():
+            # 未登录兜底：复制的 profile 可能未携带登录态，允许手动登录一次。
+            # NAS 不能交互，且 TOU/重新认证页面不能被当作普通 Rewards 页面继续执行。
+            if _is_auth_wall_url(page.url):
                 if IS_NAS:
-                    # 无头模式无法交互登录：直接报错退出，待 storage_state 刷新后由明日 cron 重试
-                    print("⚠ NAS 模式检测到登录页，无法交互登录。")
-                    print("   请检查 storage_state 是否过期（在 Windows 重新 `python rewards_earn.py export` 并覆盖）。")
-                    raise SystemExit(1)
-                print("⚠ 页面跳转到登录页：复制的 profile 未携带登录态。")
+                    print("⚠ NAS 模式检测到登录/重新认证页面，无法交互处理。")
+                    raise _auth_error(page.url)
+                print("⚠ 页面跳转到登录/重新认证页面：复制的 profile 未携带可用登录态。")
                 print("   请在打开的浏览器中手动登录 Microsoft 账户，")
-                print("   登录成功并进入 Rewards 页面后，回到此处按 Enter。")
+                print("   如出现账户条款页面，请先完成人工确认；进入 Rewards 页面后回到此处按 Enter。")
                 input("   登录完成后按 Enter 继续...")
-                await page.goto(EARN_URL, wait_until="domcontentloaded", timeout=120000)
+                response = await page.goto(EARN_URL, wait_until="domcontentloaded", timeout=120000)
                 await page.wait_for_timeout(6000)
-                print("重新打开后 URL:", page.url)
+                print("重新打开后 URL:", _display_url(page.url))
+                if _is_auth_wall_url(page.url):
+                    raise _auth_error(page.url)
+            await _require_rewards_page(page, response)
             await page.wait_for_selector("body", timeout=20000)
             # 整页截图（本地参考，可能含账户信息，勿外传）
             await page.screenshot(path="earn_page.png", full_page=True)
@@ -2266,10 +2430,8 @@ async def main():
                 print(f"  ✗ 本月攻略执行异常: {e}")
             await human_pause(1.0, 2.0)
             # 收尾复检：以页面「已完成」标记为准，漏做的自动重试一轮并写入邮件
-            try:
-                await verify_and_retry(page, context)
-            except Exception as e:
-                print(f"  ✗ 收尾复检异常: {e}")
+            await verify_and_retry(page, context)
+            await _require_rewards_page(page)
 
             # 积分自审：记录运行后「可用积分」余额（确认本次是否真的涨分）
             try:
@@ -2278,22 +2440,35 @@ async def main():
             except Exception as e:  # noqa: BLE001
                 print(f"  [积分自审] 运行后读数失败（已忽略）：{e}")
 
+            session.authenticated = True  # 最终复检成功后才允许写回登录态。
             print("全部任务执行完毕。")
+        except AuthenticationRequired as e:
+            run_state.last_run_failed = True
+            session.authenticated = False
+            print("主流程认证失败:", e)
+            try:
+                await page.screenshot(path="debug_auth_error.png", full_page=True)
+                print("已保存 debug_auth_error.png 以便排查")
+            except Exception:
+                pass
+            raise
         except Exception as e:
             run_state.last_run_failed = True
+            session.authenticated = False
             print("主流程异常:", e)
             try:
                 await page.screenshot(path="debug_error.png", full_page=True)
                 print("已保存 debug_error.png 以便排查")
             except Exception:
                 pass
+            raise
         finally:
             if IS_NAS:
                 # 无头模式无需等待人工确认，直接关闭
-                await context.close()
+                await _close_session(session, persist_state=session.authenticated)
             else:
                 input("按 Enter 关闭浏览器...")
-                await context.close()
+                await _close_session(session, persist_state=session.authenticated)
 
 
 async def export_storage_state():
@@ -2304,7 +2479,14 @@ async def export_storage_state():
     """
     _install_log()
     print("[导出] 启动 Edge（复制的登录态）以导出 storage_state ...")
-    setup_profile()
+    if IS_NAS:
+        raise RuntimeError("请在 Windows 上导出登录态，NAS 无头模式不能进行交互登录。")
+    # 默认从系统 Edge 重建副本，确保刚完成的登录/条款确认不会被旧副本遮蔽。
+    # 仅在需要复用自动化窗口副本时使用 export reuse。
+    reuse_profile = "reuse" in sys.argv
+    if not reuse_profile:
+        preflight()
+    setup_profile(force=not reuse_profile)
     cleanup_locks()
     async with async_playwright() as p:
         context: BrowserContext = await p.chromium.launch_persistent_context(
@@ -2317,17 +2499,19 @@ async def export_storage_state():
         )
         try:
             page = context.pages[0] if context.pages else await context.new_page()
-            await page.goto(EARN_URL, wait_until="domcontentloaded", timeout=120000)
+            response = await page.goto(EARN_URL, wait_until="domcontentloaded", timeout=120000)
             await page.wait_for_timeout(5000)
-            if "login" in page.url.lower() or "signin" in page.url.lower() or "live.com" in page.url.lower():
-                print("⚠ 跳转到登录页，请手动登录后回到此处按 Enter。")
+            if _is_auth_wall_url(page.url):
+                print("⚠ 跳转到登录/重新认证页面，请手动完成登录或账户条款确认后回到此处按 Enter。")
                 input("登录完成后按 Enter 继续...")
-                await page.goto(EARN_URL, wait_until="domcontentloaded", timeout=120000)
+                response = await page.goto(EARN_URL, wait_until="domcontentloaded", timeout=120000)
                 await page.wait_for_timeout(5000)
-            state = await context.storage_state(path=EXPORT_STATE_PATH)
+            await _require_rewards_page(page, response)
+            await _scan_unfinished(page)  # 任务页可读之后才覆盖正式导出文件。
+            state = await _write_storage_state(context, EXPORT_STATE_PATH)
             print(f"[导出] storage_state 已写入：{EXPORT_STATE_PATH}")
             print(f"[导出] 将该文件拷贝到 NAS 的 REWARDS_STORAGE 路径（默认 /app/data/storage_state.json）即可。")
-            print(f"[导出] 捕获的域名数：{len(state.get('cookies', []))} 条 cookie。")
+            print(f"[导出] 捕获 {len(state.get('cookies', []))} 条 cookie，{len(state.get('origins', []))} 个 origin。")
         finally:
             await context.close()
 
