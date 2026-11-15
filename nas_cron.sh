@@ -4,10 +4,12 @@
 # 用法：加入 crontab（crontab -e），让本脚本每 15 分钟被调用一次：
 #   */15 * * * * /bin/sh /share/你的卷/microsoft/nas_cron.sh >> /share/你的卷/microsoft/nas.log 2>&1
 #
-# 机制：本脚本在每天首次运行时随机生成两个触发时刻（HH:MM，去重；小时范围 09:00–21:00，白天活动时段，规避深夜/凌晨），
+# 机制：本脚本在每天首次运行时随机生成两个触发时刻（HH:MM，去重；小时范围 08:00–20:00，
+#       白天活动时段，规避深夜/凌晨），
 #       仅当当前时间到达某个「尚未执行」的时刻，才真正拉起容器；其余调用直接退出。
 #       这样实现「一天两次随机触发」，避免固定时刻被风控识别。
 # 说明：实际触发时刻 = 随机 HH:MM 之后最近的一次 cron 调用（≤15 分钟误差）。
+# 判定：每日 21:00 由本脚本调用 run_health_watchdog.py，当天没有成功运行就立即发信。
 #
 # 若用 Docker（推荐）：先 build 镜像
 #   docker build -t ms-rewards /share/你的卷/microsoft
@@ -27,11 +29,54 @@ DOCKER_BIN="${REWARDS_DOCKER_BIN:-/share/CACHEDEV1_DATA/.qpkg/container-station/
 LOCK_DIR="${DATA_DIR}/.run.lock"
 SCHED_LOCK_DIR="${DATA_DIR}/.schedule.lock"
 MANUAL_STATE="${DATA_DIR}/manual_run.state"
+AUTH_BLOCK="${DATA_DIR}/auth_required.json"
+STATE_FILE="${DATA_DIR}/storage_state.json"
 # 防止面板/外部调用异常地反复注入 --now。手动任务完成后 20 小时内拒绝重复立即执行；
 # 需要排障时显式传 --force，正常 cron 不受此限制。
 MANUAL_COOLDOWN_SECONDS="${REWARDS_MANUAL_COOLDOWN_SECONDS:-72000}"
 IMMEDIATE_DELAY_MAX_SECONDS="${REWARDS_IMMEDIATE_DELAY_MAX_SECONDS:-60}"
 SCHEDULED_DELAY_MAX_SECONDS="${REWARDS_SCHEDULED_DELAY_MAX_SECONDS:-1800}"
+
+# ---- 时钟自愈（防 RTC 归零导致 TLS/邮件/登录全盘静默失败）----
+# QNAP 的 RTC 掉电/电池失效后，开机系统时间会归零（如回到 2012）：HTTPS 证书校验、
+# SMTP SSL、站点登录全部失败；而 QNAP NTP 客户端对大偏移不主动纠正，系统不会自愈。
+# 本脚本每 15 分钟以 root 被 cron 调用，这里做兜底：仅当年份异常时才强制 ntpdate
+# 步进并回写 RTC（正常时钟下零动作），幂等、可安全反复执行。
+_clock_year="$(date +%Y 2>/dev/null || echo 0)"
+case "$_clock_year" in ''|*[!0-9]*) _clock_year=0 ;; esac
+if [ "$_clock_year" -lt 2020 ]; then
+    _clk_log="${SCRIPT_DIR}/clock_selfheal.log"
+    echo "[$(date)] 检测到系统时间异常（年份=$_clock_year），强制 NTP 校准..." | tee -a "$_clk_log"
+    if /sbin/ntpdate -u -b pool.ntp.org >> "$_clk_log" 2>&1; then
+        echo "[$(date)] NTP 校准完成：$(date)" | tee -a "$_clk_log"
+        /sbin/hwclock -w >> "$_clk_log" 2>&1 && echo "[$(date)] 已回写 RTC" | tee -a "$_clk_log"
+    else
+        echo "[$(date)] NTP 校准失败（网络不可达？），保持现状" | tee -a "$_clk_log"
+    fi
+fi
+
+# ---- 每日运行看门狗：判断主流程到底有没有「成功跑起来」----
+# 必须放在 disabled/auth 等早退分支之前：那两类情况恰恰是最需要告警的静默失败
+# （任务被暂停、认证墙阻塞、容器起不来、cron 塔被剥离）。脚本内部自闸门，一天只处理一次，
+# 且 21:00 前不判定（签到窗 08:00–20:00 尚未走完，早判会误报）。健康时不发信，只写一行 watchdog.log。
+_H_NOW="$(date +%H 2>/dev/null || echo 21)"; _H_NOW=${_H_NOW#0}; [ -n "$_H_NOW" ] || _H_NOW=21
+if [ "$_H_NOW" -ge 21 ]; then
+    _HEALTH_PY="/opt/python3/bin/python3"
+    [ -x "$_HEALTH_PY" ] || _HEALTH_PY="/share/CACHEDEV1_DATA/.qpkg/Python3/opt/python3/bin/python3"
+    if [ -x "$_HEALTH_PY" ] && [ -f "${SCRIPT_DIR}/run_health_watchdog.py" ]; then
+        _health_rc=0
+        "$_HEALTH_PY" "${SCRIPT_DIR}/run_health_watchdog.py" >> "${DATA_DIR}/watchdog.log" 2>&1 || _health_rc=$?
+        [ "$_health_rc" -ne 0 ] && echo "[$(date)] 运行看门狗异常退出 rc=$_health_rc"
+    fi
+
+    # 跨项目兜底：同样在 21:00 判定 img.ink 当天是否成功扩容。
+    # img.ink 自己的 23:30 条目若被单独删掉，仍有这一道；两边共用 alert_state.json 去重，
+    # 同一天最多一封，不会因为两条调度都跑而重复发信。
+    _IMG_WATCH="${REWARDS_IMG_WATCHDOG:-/share/CACHEDEV1_DATA/Web/gadget/auto_sign/watchdog.py}"
+    if [ -x "$_HEALTH_PY" ] && [ -f "$_IMG_WATCH" ]; then
+        "$_HEALTH_PY" "$_IMG_WATCH" >> /share/CACHEDEV1_DATA/Web/gadget/auto_sign/watchdog.log 2>&1 || true
+    fi
+fi
 
 # ---- 立即模式：面板「立即执行」时跳过随机时刻，直接跑（随机延迟 ≤1 分钟）----
 # 触发方式（任一即可）：
@@ -52,6 +97,25 @@ fi
 if [ "$IMMEDIATE" != "1" ] && [ -f "$DISABLED_FLAG" ]; then
     echo "[$(date)] 微软积分任务已暂停（disabled.flag），本次跳过。"
     exit 0
+fi
+
+# 认证墙是外部人工前置条件。认证事件文件比 storage_state 新时，暂停所有自动重试；
+# Windows 端完成条款确认并覆盖状态文件后，mtime 自动解除阻塞，避免撞击账号。
+auth_blocked() {
+    [ ! -f "$AUTH_BLOCK" ] && return 1
+    [ ! -f "$STATE_FILE" ] && return 0
+    _blocked_hash="$(sed -n 's/.*"state_sha256"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]*\)".*/\1/p' "$AUTH_BLOCK" | head -n 1)"
+    _state_hash="$(sha256sum "$STATE_FILE" 2>/dev/null | awk '{print $1}')"
+    # 新文件可能保留旧 mtime，因此优先比较内容指纹；兼容旧 marker 时回退 mtime。
+    if [ -n "$_blocked_hash" ] && [ -n "$_state_hash" ]; then
+        [ "$_blocked_hash" = "$_state_hash" ]
+    else
+        [ "$AUTH_BLOCK" -nt "$STATE_FILE" ]
+    fi
+}
+if auth_blocked; then
+    echo "[$(date)] 检测到 ${AUTH_BLOCK}，任务暂停：请在 Windows 完成账户条款/重新认证并更新 storage_state.json。"
+    exit 2
 fi
 
 epoch_now() { date +%s; }
@@ -173,15 +237,18 @@ else
 fi
 
 if [ "$NEED_NEW" = "1" ]; then
-    # 触发时刻限制在 09:00–21:00（白天活动时段），小时取 9..21（共 13 小时窗）
-    H1=$(( (RANDOM % 13) + 9 )); M1=$((RANDOM % 60))
-    H2=$(( (RANDOM % 13) + 9 )); M2=$((RANDOM % 60))
+    # 触发窗固定在 08:00–20:00（用户契约：早上八点到晚上八点）。
+    # 直接按「分钟偏移」随机，保证最晚一个槽位正好是 20:00，而不是 20:59——
+    # 槽位后面还要叠加 0–30 分钟的随机延迟，若槽位能到 20:59，实际启动会滑过 21:00，
+    # 把当日判定误报成「未成功」。
+    T1MIN=$(( RANDOM % 721 + 480 ))   # 480 = 08:00，1200 = 20:00，共 721 分钟
+    T2MIN=$(( RANDOM % 721 + 480 ))
     # 去重：两个时刻至少差 1 分钟
-    while [ $((H1 * 60 + M1)) -eq $((H2 * 60 + M2)) ]; do
-        H2=$(( (RANDOM % 13) + 9 )); M2=$((RANDOM % 60))
+    while [ "$T1MIN" -eq "$T2MIN" ]; do
+        T2MIN=$(( RANDOM % 721 + 480 ))
     done
-    S1=$(printf '%02d:%02d' $H1 $M1)
-    S2=$(printf '%02d:%02d' $H2 $M2)
+    S1=$(printf '%02d:%02d' $((T1MIN / 60)) $((T1MIN % 60)))
+    S2=$(printf '%02d:%02d' $((T2MIN / 60)) $((T2MIN % 60)))
     {
         echo "DATE=$TODAY"
         echo "SLOT1=$S1"

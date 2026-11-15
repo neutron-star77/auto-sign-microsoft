@@ -9,6 +9,7 @@ Microsoft Rewards (rewards.bing.com/earn) 自动打卡脚本
 注意：页面为登录态，元素 class/id 会变化。本脚本以「可见文字」为主选择器并做多重兜底。
 运行时若报元素未找到，请把控制台日志/截图发回，便于精修选择器。
 """
+
 import asyncio
 import os
 import random
@@ -20,16 +21,24 @@ import time
 import json
 import traceback
 import tempfile
+import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime
 from urllib.parse import urlsplit, urlunsplit
 
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Locator
+from playwright.async_api import (
+    async_playwright,
+    Browser,
+    BrowserContext,
+    Page,
+    Locator,
+)
 
 
 # ====================== 运行日志文件 ======================
 class _Tee:
     """把输出同时写到多个流（控制台 + 日志文件）。"""
+
     def __init__(self, *streams):
         self.streams = list(streams)
 
@@ -76,11 +85,17 @@ def _install_log():
 @dataclass
 class RunState:
     last_run_failed: bool = False
-    points_before: int | None = None        # 积分差额自审：运行前可用积分（读不到为 None）
-    points_after: int | None = None         # 运行后可用积分
-    daily_set_result: dict | None = None    # 每日活动三张卡片 +「可领取」处理结果（供邮件汇报）
-    unfinished: list = field(default_factory=list)  # 收尾复检仍未完成清单（写进结果邮件）
-    structural_failures: list = field(default_factory=list)  # 结构级异常（发【结构异常】告警邮件）
+    points_before: int | None = None  # 积分差额自审：运行前可用积分（读不到为 None）
+    points_after: int | None = None  # 运行后可用积分
+    daily_set_result: dict | None = (
+        None  # 每日活动三张卡片 +「可领取」处理结果（供邮件汇报）
+    )
+    unfinished: list = field(
+        default_factory=list
+    )  # 收尾复检仍未完成清单（写进结果邮件）
+    structural_failures: list = field(
+        default_factory=list
+    )  # 结构级异常（发【结构异常】告警邮件）
 
 
 run_state = RunState()
@@ -89,7 +104,12 @@ run_state = RunState()
 # ====================== 本月攻略 punchcard 的稳定识别（跨月免维护） ======================
 # 识别键取「最稳定的信号」：机器生成的 quest ID 模式 > 结构化文案特征（见 ADR-0002）。
 # 绝不写死月份名 / 子任务名——微软每月全换文案（八月标题「让这个八月收获更多」根本不叫「八月攻略」）。
-MONTHLY_QUEST_RE = re.compile(r"BingMonthlyPC_[A-Za-z]{3}_punchcard", re.I)
+MONTHLY_QUEST_RE = re.compile(
+    r"(?:BingMonthlyPC_[^/?#]+|pcparent_[^/?#]+)_punchcard(?:[/?#]|$)", re.I
+)
+MONTHLY_TOTAL_WEEKS = 4
+MONTHLY_DAILY_SEARCH_INTERVAL = 24 * 60 * 60
+
 
 def is_monthly_strategy(text: str, href: str) -> bool:
     """识别「本月攻略」父卡片：优先 URL 模式，回退到结构化文案特征。
@@ -98,8 +118,8 @@ def is_monthly_strategy(text: str, href: str) -> bool:
     """
     if href and MONTHLY_QUEST_RE.search(href):
         return True
-    # 回退：形如「x/4 个任务」的多子任务打卡卡片（ADR-0002 验证过的结构信号）
-    return bool(re.search(r"\d\s*/\s*4\s*个任务", text or ""))
+    # 回退：形如「x/N 个任务」的多子任务打卡卡片。
+    return bool(re.search(r"\d+\s*/\s*\d+\s*个任务", text or ""))
 
 
 def is_locked_monthly(text: str, href: str = "") -> bool:
@@ -113,8 +133,12 @@ def is_locked_monthly(text: str, href: str = "") -> bool:
     即将开放』等。注意：仅对 is_monthly_strategy 命中的任务使用本判定，避免误伤。
     """
     t = text or ""
-    return bool(re.search(
-        r"到期日期|\d+\s*周(后|内)|\d+\s*天(后|内)|锁定|未解锁|即将开放|未开放|暂不可", t))
+    return bool(
+        re.search(
+            r"到期日期|\d+\s*周(后|内)|\d+\s*天(后|内)|锁定|未解锁|即将开放|未开放|暂不可",
+            t,
+        )
+    )
 
 
 def _parse_monthly_progress(text: str):
@@ -126,6 +150,62 @@ def _parse_monthly_progress(text: str):
     if m:
         return int(m.group(1)), int(m.group(2))
     return None, None
+
+
+def is_monthly_daily_search(text: str) -> bool:
+    """识别需要跨天搜索的月度子任务，而不是普通一次性搜索行。"""
+    t = re.sub(r"\s+", " ", text or "").lower()
+    return bool(
+        re.search(
+            r"5\s*out\s*of\s*10\s*days|at least 24 hours apart|bing has your halloween answers",
+            t,
+        )
+    )
+
+
+def parse_monthly_daily_progress(text: str):
+    m = re.search(
+        r"\(?\s*(\d+)\s*/\s*(\d+)\s*days?\s*(?:complete)?\s*\)?", text or "", re.I
+    )
+    return (int(m.group(1)), int(m.group(2))) if m else (None, None)
+
+
+def monthly_daily_progress_advanced(before_text: str, after_text: str) -> bool:
+    """判断一次搜索是否让 N/5 的跨天进度至少递增一天。"""
+    before_done, before_total = parse_monthly_daily_progress(before_text)
+    after_done, after_total = parse_monthly_daily_progress(after_text)
+    return (
+        before_done is not None
+        and after_done is not None
+        and before_total == after_total
+        and after_done >= before_done + 1
+    )
+
+
+def _monthly_daily_state_path() -> str:
+    base = "/app/data" if IS_NAS else os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "monthly_daily_search_state.json")
+
+
+def monthly_daily_search_allowed(now: float | None = None) -> bool:
+    state = _load_json(_monthly_daily_state_path(), {})
+    last = state.get("last_search_at")
+    if not isinstance(last, (int, float)):
+        return True
+    return (
+        now if now is not None else time.time()
+    ) - last >= MONTHLY_DAILY_SEARCH_INTERVAL
+
+
+def mark_monthly_daily_search(now: float | None = None) -> None:
+    _save_json(
+        _monthly_daily_state_path(),
+        {
+            "last_search_at": now if now is not None else time.time(),
+            "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
+        },
+        "写入月度每日搜索状态失败",
+    )
 
 
 def current_month_week_index(now: datetime | None = None) -> int:
@@ -144,6 +224,7 @@ def current_month_week_index(now: datetime | None = None) -> int:
 # 与日常「有 N 项未完成」的噪音级邮件区分（见 ADR-0002 §3.5）——已收纳进上方 run_state（D1）。
 # 积分差额自审：运行前后「可用积分」余额等全部运行期状态，同上收敛进 run_state。
 
+
 def _monthly_state_path() -> str:
     base = "/app/data" if IS_NAS else os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base, "monthly_state.json")
@@ -153,6 +234,12 @@ def _mail_state_path() -> str:
     """邮件去重状态：同日同类型只发一次。"""
     base = "/app/data" if IS_NAS else os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base, "mail_notify_state.json")
+
+
+def _auth_status_path() -> str:
+    """认证阻塞事件文件；NAS 调度器据此暂停，直到新状态文件到达。"""
+    base = "/app/data" if IS_NAS else os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "auth_required.json")
 
 
 def _load_json(path, default):
@@ -166,12 +253,60 @@ def _load_json(path, default):
 
 
 def _save_json(path, data, err_label="写入状态文件失败"):
-    """D6：统一『写 JSON 状态文件』，错误提示统一由调用方给 err_label。"""
+    """统一原子写 JSON 状态文件，避免断电留下半个状态文件。"""
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        target = os.path.abspath(path)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(
+            prefix=".rewards-json-", dir=os.path.dirname(target)
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_path, target)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
     except Exception as e:
         print(f"    ⚠ {err_label}: {e}")
+
+
+def _mark_auth_required(error: "AuthenticationRequired") -> None:
+    """记录认证墙，供 NAS 调度器熔断，且不触碰旧登录态。"""
+    state_hash = ""
+    if IS_NAS:
+        try:
+            with open(NAS_STORAGE_STATE, "rb") as f:
+                state_hash = hashlib.sha256(f.read()).hexdigest()
+        except OSError:
+            pass
+    _save_json(
+        _auth_status_path(),
+        {
+            "code": error.code,
+            "url": _display_url(getattr(error, "url", "")) or "unknown",
+            "message": str(error),
+            "detected_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "state_path": NAS_STORAGE_STATE if IS_NAS else "",
+            "state_sha256": state_hash,
+        },
+        "写入 auth_required.json 失败",
+    )
+    print(f"[认证熔断] 已记录 {error.code}，待新的 storage_state.json 到达后自动解除。")
+
+
+def _clear_auth_required() -> None:
+    """只有认证成功且新状态已安全写回后才清除熔断标记。"""
+    path = _auth_status_path()
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+            print("[认证熔断] 登录态已验证并写回，解除调度阻塞。")
+    except OSError as e:
+        print(f"    ⚠ 清理 auth_required.json 失败：{e}")
 
 
 def _load_mail_state() -> dict:
@@ -186,17 +321,65 @@ def _mail_day_key() -> str:
     return time.strftime("%Y-%m-%d")
 
 
-def _write_monthly_state(weekly_done: int, weekly_total: int) -> None:
+def _heartbeat_path() -> str:
+    """运行心跳：供每日运行看门狗判断「这程序到底有没有跑起来」。
+
+    失败邮件只在「跑起来但失败」时发得出去；进程根本没启动（cron 被剥离、
+    容器起不来、登录态崩溃在 import 阶段）时不会有任何输出，只能靠心跳缺失发现。
+    """
+    base = "/app/data" if IS_NAS else os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "run_heartbeat.json")
+
+
+def _write_heartbeat(failed: bool, error: str = "") -> None:
+    """每次运行收尾写一次心跳。
+
+    ok=True 仅当「本轮既没失败、也没有遗留未完成任务」；
+    看门狗只认 ok=True 的日期，避免「每天跑了但每天都失败」被误判成健康。
+    """
+    ok = (not failed) and not run_state.unfinished
+    prev = _load_json(_heartbeat_path(), {})
+    last_ok = _mail_day_key() if ok else (prev.get("last_ok_date") or "")
+    payload = {
+        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "date": _mail_day_key(),
+        "ok": bool(ok),
+        "failed": bool(failed),
+        "unfinished": len(run_state.unfinished),
+        "error": (error or "")[:300],
+        "points_before": run_state.points_before,
+        "points_after": run_state.points_after,
+        # 跨运行累积：只由成功运行推进。失败运行不得把「上次成功日」抹掉，
+        # 否则看门狗会把「连续多天失败」误读成「从未成功」。
+        "last_ok_date": last_ok,
+    }
+    _save_json(_heartbeat_path(), payload, "[心跳] 写入运行心跳失败")
+    print(f"[心跳] 已记录 ok={payload['ok']} unfinished={payload['unfinished']}")
+
+
+def _write_monthly_state(
+    weekly_done: int,
+    weekly_scanned: int | None = None,
+    weekly_locked: int | None = None,
+    weekly_total: int = MONTHLY_TOTAL_WEEKS,
+) -> None:
     """成功定位并扫描到本月攻略后记录进度，供月度看门狗独立消费（见 ADR-0002 §5.2）。
 
     仅在确实找到卡片、完成扫描时调用；定位失败（零匹配）不写，留给看门狗发现。
     """
+    # 月度任务的总周数是产品契约，不是本次 DOM 扫描到的可开放行数。
+    # 旧实现把“开放周数”写进 weekly_total，页面漏收一行时会制造 1/1 假象，
+    # 让看门狗无法区分“只扫描到一行”和“整月只有一周”。
     data = {
         "month": time.strftime("%Y-%m"),
-        "weekly_done": weekly_done,
-        "weekly_total": weekly_total,
+        "weekly_done": max(0, min(int(weekly_done), int(weekly_total))),
+        "weekly_total": int(weekly_total),
         "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
+    if weekly_scanned is not None:
+        data["weekly_scanned"] = int(weekly_scanned)
+    if weekly_locked is not None:
+        data["weekly_locked"] = int(weekly_locked)
     _save_json(_monthly_state_path(), data, "写入 monthly_state.json 失败")
     print(f"    已写入月度进度 monthly_state.json: {weekly_done}/{weekly_total}")
 
@@ -266,9 +449,12 @@ async def humanize_read(popup: Page, min_t: float = 8.0, max_t: float = 18.0):
     """
     t0 = time.time()
     try:
-        await popup.mouse.wheel(0, random.randint(200, 700)); await human_pause(1.5, 3.5)
-        await popup.mouse.wheel(0, random.randint(300, 900)); await human_pause(1.5, 4.0)
-        await popup.mouse.wheel(0, -random.randint(200, 600)); await human_pause(1.0, 2.5)
+        await popup.mouse.wheel(0, random.randint(200, 700))
+        await human_pause(1.5, 3.5)
+        await popup.mouse.wheel(0, random.randint(300, 900))
+        await human_pause(1.5, 4.0)
+        await popup.mouse.wheel(0, -random.randint(200, 600))
+        await human_pause(1.0, 2.5)
     except Exception:
         pass
     remain = rand(min_t, max_t) - (time.time() - t0)
@@ -289,7 +475,7 @@ def _load_mail_config():
         cfg_path = os.path.join(here, "config.json")
         if os.path.exists(cfg_path):
             with open(cfg_path, "r", encoding="utf-8") as f:
-                cfg = (json.load(f).get("email_notify") or {})
+                cfg = json.load(f).get("email_notify") or {}
     except Exception:
         cfg = {}
 
@@ -298,9 +484,13 @@ def _load_mail_config():
         return v if v not in (None, "") else default
 
     return {
-        "enabled": str(_env("REWARDS_MAIL_ENABLED", cfg.get("enabled", "false"))).lower()
-                   in ("1", "true", "yes"),
-        "smtp_server": _env("REWARDS_MAIL_SERVER", cfg.get("smtp_server", "smtp.qq.com")),
+        "enabled": str(
+            _env("REWARDS_MAIL_ENABLED", cfg.get("enabled", "false"))
+        ).lower()
+        in ("1", "true", "yes"),
+        "smtp_server": _env(
+            "REWARDS_MAIL_SERVER", cfg.get("smtp_server", "smtp.qq.com")
+        ),
         "smtp_port": int(_env("REWARDS_MAIL_PORT", cfg.get("smtp_port", 465))),
         "sender": _env("REWARDS_MAIL_SENDER", cfg.get("sender", "")),
         "auth_code": _env("REWARDS_MAIL_AUTH", cfg.get("auth_code", "")),
@@ -321,12 +511,15 @@ def send_mail(subject, body):
         import smtplib, ssl
         from email.mime.text import MIMEText
         from email.header import Header
+
         msg = MIMEText(body, "plain", "utf-8")
         msg["Subject"] = Header(subject, "utf-8")
         msg["From"] = m["sender"]
         msg["To"] = m["recipient"]
         if int(m["smtp_port"]) == 465:
-            with smtplib.SMTP_SSL(m["smtp_server"], int(m["smtp_port"]), timeout=20) as s:
+            with smtplib.SMTP_SSL(
+                m["smtp_server"], int(m["smtp_port"]), timeout=20
+            ) as s:
                 s.login(m["sender"], m["auth_code"])
                 s.sendmail(m["sender"], [m["recipient"]], msg.as_string())
         else:
@@ -339,6 +532,38 @@ def send_mail(subject, body):
     except Exception as e:
         print(f"[邮件] 发送失败：{e}")
         return False
+
+
+def _error_code(error_text: str) -> str:
+    """把异常统一映射为稳定码，避免邮件依赖 Playwright 原始文案。"""
+    explicit = error_text.split(":", 1)[0] if ":" in error_text else ""
+    known = {
+        "TOU_REQUIRED",
+        "AUTH_EXPIRED",
+        "CHALLENGE_REQUIRED",
+        "AUTH_IMPORT_INVALID",
+        "UNKNOWN_REDIRECT",
+        "NAVIGATION_FAILED",
+        "SELECTOR_FAILED",
+        "EXPORT_EDGE_CLOSED",
+        "TARGET_CLOSED",
+        "ERR_ABORTED",
+        "VERIFY_EMPTY_PAGE",
+        "VERIFY_HTTP_ERROR",
+    }
+    if explicit in known or explicit.startswith("VERIFY_"):
+        return explicit
+    lowered = error_text.lower()
+    if any(
+        x in lowered
+        for x in ("timeout", "locator", "strict mode", "selector", "element is not")
+    ):
+        return "SELECTOR_FAILED"
+    if "targetclosederror" in lowered or "browsercontext.new_page" in lowered:
+        return "TARGET_CLOSED"
+    if "err_aborted" in lowered:
+        return "ERR_ABORTED"
+    return explicit or "UNKNOWN_ERROR"
 
 
 def _build_mail_body(failed, error=""):
@@ -361,28 +586,116 @@ def _build_mail_body(failed, error=""):
                 tail = "\n".join(f.read().splitlines()[-50:])
     except Exception:
         tail = "(无法读取运行日志)"
+    error_text = str(error or "")
+    error_code = _error_code(error_text)
+    recovery = {
+        "TOU_REQUIRED": (
+            "含义：Microsoft 要求重新确认账户条款或重新认证，NAS 无法代替人工确认。\n"
+            "自动动作：已写入 auth_required.json，并暂停后续自动调度，避免反复失败。\n"
+            "处理：Windows 完成条款确认后执行 `python rewards_earn.py export`，再用真实 NAS 路径覆盖 storage_state.json。"
+        ),
+        "AUTH_EXPIRED": (
+            "含义：Microsoft 登录态已过期。\n"
+            "自动动作：已熔断自动任务并保留原登录态文件。\n"
+            "处理：Windows 重新登录后执行 `python rewards_earn.py export`，再部署新的 storage_state.json。"
+        ),
+        "CHALLENGE_REQUIRED": (
+            "含义：页面要求人工完成验证码、人机验证或二次认证。\n"
+            "自动动作：已停止当前任务，未覆盖有效登录态。\n"
+            "处理：Windows 浏览器完成验证，再重新 export storage_state。"
+        ),
+        "AUTH_IMPORT_INVALID": (
+            "含义：storage_state.json 缺少 cookies/origins 或 JSON 已损坏。\n"
+            "自动动作：拒绝启动任务，避免用坏状态覆盖生产文件。\n"
+            "处理：重新 export，并核对远端 SHA-256、字节数和 CR=0。"
+        ),
+        "UNKNOWN_REDIRECT": (
+            "含义：页面跳转到了未知地址，无法确认是否仍在 Rewards。\n"
+            "自动动作：停止扫描，不把空页面当成成功。\n"
+            "处理：检查网络、登录态和 debug_auth_error.png；不要盲目重试。"
+        ),
+        "VERIFY_": (
+            "含义：页面或 HTTP 返回无法提供可信的完成状态。\n"
+            "自动动作：执行收尾复检并把未完成任务写入邮件，避免假成功。\n"
+            "处理：先运行 `python rewards_earn.py verify` 只读核对，再根据日志定位页面结构变化。"
+        ),
+        "NAVIGATION_FAILED": (
+            "含义：Rewards 页面导航失败，常见原因是网络、DNS 或浏览器进程异常。\n"
+            "自动动作：导航会按策略重试；仍失败则保留现有状态并发信。\n"
+            "处理：检查 NAS 网络和 Chromium，再重试。"
+        ),
+        "SELECTOR_FAILED": (
+            "含义：页面元素定位或点击失败，通常是微软页面结构变化。\n"
+            "自动动作：已执行一次收尾复检，未确认完成的任务不会被标为成功。\n"
+            "处理：查看最新日志/快照，更新对应选择器；不要重新导出登录态。"
+        ),
+        "EXPORT_EDGE_CLOSED": (
+            "含义：Edge/Playwright 导出页面被关闭。\n"
+            "自动动作：脚本已自动重启一次导出上下文。\n"
+            "处理：关闭所有 Edge 窗口后重试，并确认 edge_profile 可写。"
+        ),
+        "TARGET_CLOSED": (
+            "含义：浏览器上下文或页面已被关闭，导出/任务无法继续。\n"
+            "自动动作：已重建一次 Playwright 页面；原登录态文件不会被覆盖。\n"
+            "处理：关闭所有 Edge/Chromium 窗口后重试。"
+        ),
+        "ERR_ABORTED": (
+            "含义：浏览器导航被中断，通常由旧页面关闭或 Edge 进程抢占造成。\n"
+            "自动动作：已等待并重试导航；仍失败则保留原文件。\n"
+            "处理：关闭所有 Edge 窗口后重新执行 export。"
+        ),
+        "VERIFY_EMPTY_PAGE": (
+            "含义：页面为空，无法确认登录和任务完成状态。\n"
+            "自动动作：拒绝把空页面判定为成功，也不会覆盖登录态。\n"
+            "处理：检查 NAS 网络、Chromium 和 Rewards 页面可达性。"
+        ),
+        "VERIFY_HTTP_ERROR": (
+            "含义：Rewards 返回 HTTP 错误，任务结果不可信。\n"
+            "自动动作：停止复检并保留当前状态。\n"
+            "处理：查看错误日志，确认网络或微软服务恢复后再运行。"
+        ),
+    }
     if failed:
-        head = "任务执行失败，请检查登录态或页面选择器。"
+        head = f"任务执行失败 [{error_code or 'UNKNOWN_ERROR'}]。"
+        for prefix, action in recovery.items():
+            if error_code == prefix or (
+                prefix.endswith("_") and error_code.startswith(prefix)
+            ):
+                head += f"\n{action}"
+                break
+        else:
+            head += (
+                "\n含义：脚本遇到未分类异常，无法安全自动修复。"
+                "\n自动动作：已停止任务并保留现有登录态，避免覆盖有效文件。"
+                "\n处理：查看日志末尾和完整异常类型，再决定是否重试。"
+            )
     elif run_state.unfinished:
         head = f"任务已执行，但收尾复检发现 {len(run_state.unfinished)} 项仍未完成（已自动重试一次）："
         head += "\n" + "\n".join(f"  · {t}" for t in run_state.unfinished)
     else:
         head = "任务执行成功（收尾复检：页面上所有任务均已标记完成）。"
-    if error:
-        head += f"\n错误信息：{error}"
+    if error_text:
+        head += f"\n错误信息：{error_text}"
     # 积分差额自审：确认「积分真的涨了」，而非仅看页面「已完成」标记
     try:
         if run_state.points_before is not None or run_state.points_after is not None:
-            pb = "?" if run_state.points_before is None else str(run_state.points_before)
+            pb = (
+                "?" if run_state.points_before is None else str(run_state.points_before)
+            )
             pa = "?" if run_state.points_after is None else str(run_state.points_after)
-            if run_state.points_before is not None and run_state.points_after is not None:
+            if (
+                run_state.points_before is not None
+                and run_state.points_after is not None
+            ):
                 delta = run_state.points_after - run_state.points_before
                 if delta > 0:
                     verdict = "已确认积分增长（自审通过）"
                 elif not run_state.unfinished:
                     verdict = "余额未变化：任务标记完成但积分未增（可能延迟入账或已于昨日计入）"
                 else:
-                    verdict = "既有未完成任务、余额也未增长，疑似选择器失效或风控，需人工排查"
+                    verdict = (
+                        "既有未完成任务、余额也未增长，疑似选择器失效或风控，需人工排查"
+                    )
                 head += f"\n[积分自审] 运行前 {pb} -> 运行后 {pa}（差额 {delta:+d}）{verdict}"
             else:
                 head += f"\n[积分自审] 运行前 {pb} -> 运行后 {pa}（仅一端读数成功，无法计算差额）"
@@ -395,7 +708,15 @@ def _build_mail_body(failed, error=""):
 
 
 def _notify_mail(failed, error=""):
-    """结果邮件入口：手动触发可设 REWARDS_MAIL_OFF=1 关闭。"""
+    """结果邮件入口：仅失败时发信（2026-11-16 用户规则），手动触发可设 REWARDS_MAIL_OFF=1 关闭。"""
+    need_notify = (
+        bool(failed)
+        or bool(run_state.unfinished)
+        or bool(run_state.structural_failures)
+    )
+    if not need_notify:
+        print("[邮件] 本次运行无失败项，按「仅失败发信」规则跳过通知。")
+        return
     if os.environ.get("IMMEDIATE") == "1":
         print("[邮件] IMMEDIATE=1，跳过邮件通知。")
         return
@@ -403,18 +724,31 @@ def _notify_mail(failed, error=""):
         print("[邮件] REWARDS_MAIL_OFF=1，跳过邮件通知。")
         return
     today = _mail_day_key()
-    status = "failure" if failed else "success"
+    # 已过滤掉「全部成功且无遗留」的运行，这里一律按告警类去重（同日最多一封）。
+    status = "failure"
     state = _load_mail_state()
     if state.get(status) == today:
         print(f"[邮件] 今日 {status} 邮件已发送过，跳过重复通知。")
         return
-    tag = "失败" if failed else (f"部分未完成({len(run_state.unfinished)})" if run_state.unfinished else "成功")
+    error_text = str(error or "")
+    error_code = _error_code(error_text)
+    tag = (
+        (error_code or "失败")
+        if failed
+        else (
+            f"部分未完成({len(run_state.unfinished)})"
+            if run_state.unfinished
+            else "成功"
+        )
+    )
     subject = f"微软积分自动任务 {time.strftime('%Y-%m-%d %H:%M')} - {tag}"
     body = _build_mail_body(failed, error)
     if run_state.structural_failures:
         body += "\n[结构异常]\n"
         body += "\n".join(f"  · {s}" for s in run_state.structural_failures)
-        body += "\n\n这通常意味着页面结构 / 识别键已变化，脚本可能整月零完成而未被发现。"
+        body += (
+            "\n\n这通常意味着页面结构 / 识别键已变化，脚本可能整月零完成而未被发现。"
+        )
         body += "\n请检查 is_monthly_strategy 识别键是否仍匹配当前页面（见 ADR-0002）。"
     if send_mail(subject, body):
         state[status] = today
@@ -427,7 +761,10 @@ SRC_PROFILE = r"C:\Users\ADMIN\AppData\Local\Microsoft\Edge\User Data"
 # Playwright 实际使用的目录：必须是「非默认」路径，否则报
 # "DevTools remote debugging requires a non-default data directory"。
 # 首次运行会从 SRC_PROFILE 复制一份登录态过来（同 Windows 用户下 DPAPI 仍可解密）。
-PROFILE_DIR = r"F:\AI\tasks\auto-sign\microsoft\edge_profile"
+PROFILE_DIR = os.environ.get(
+    "REWARDS_WINDOWS_PROFILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "edge_profile"),
+)
 EARN_URL = "https://rewards.bing.com/earn"
 DASHBOARD_URL = "https://rewards.bing.com/dashboard"
 HEADLESS = False  # 必须非无头，才能复用桌面登录态并观察
@@ -436,10 +773,10 @@ HEADLESS = False  # 必须非无头，才能复用桌面登录态并观察
 # 杜绝 EARN/周扫描等 6 处各自写死。内嵌 JS 的 page.evaluate() 周任务扫描器保持原样
 # （r-string 含大量 `{}`，转 f-string 会破坏对象字面量），见周扫描处注释说明如何对齐。
 SELECTORS = {
-    "SEARCH_HREF": "bing.com/search",         # 搜索任务链接 href 特征（classify_offer / 跳转搜索）
-    "STATUS_OK": "statusSuccessRewardsBg",    # 完成绿勾徽章类（周任务 / 活动判定）
-    "DS_CARD": "a[href*='DailySet']",         # DailySet 兜底卡片
-    "A_TARGET": "a[data-offer-target='1']",   # click_offer 真人点击前打标的 <a>
+    "SEARCH_HREF": "bing.com/search",  # 搜索任务链接 href 特征（classify_offer / 跳转搜索）
+    "STATUS_OK": "statusSuccessRewardsBg",  # 完成绿勾徽章类（周任务 / 活动判定）
+    "DS_CARD": "a[href*='DailySet']",  # DailySet 兜底卡片
+    "A_TARGET": "a[data-offer-target='1']",  # click_offer 真人点击前打标的 <a>
 }
 
 
@@ -542,7 +879,9 @@ def _auth_failure_message(url: str) -> str:
 def _auth_error(url: str) -> AuthenticationRequired:
     target = _display_url(url).lower()
     code = "TOU_REQUIRED" if "/tou/" in target else "AUTH_EXPIRED"
-    return AuthenticationRequired(_auth_failure_message(url), code=code)
+    error = AuthenticationRequired(_auth_failure_message(url), code=code)
+    error.url = url
+    return error
 
 
 async def _require_rewards_page(page: Page, response=None) -> None:
@@ -550,21 +889,37 @@ async def _require_rewards_page(page: Page, response=None) -> None:
     if _is_auth_wall_url(page.url):
         raise _auth_error(page.url)
     parsed = urlsplit(page.url)
-    if (parsed.hostname != "rewards.bing.com" or
-            parsed.path.rstrip("/") not in ("/earn", "/dashboard", "/rewards/dashboard")):
+    if parsed.hostname != "rewards.bing.com" or parsed.path.rstrip("/") not in (
+        "/earn",
+        "/dashboard",
+        "/rewards/dashboard",
+    ):
         raise AuthenticationRequired(
             f"未进入 Rewards 任务页：{_display_url(page.url)}，请检查重定向或重新导出登录态。",
             code="UNKNOWN_REDIRECT",
         )
     if response is not None and response.status >= 400:
-        raise VerificationError(f"VERIFY_HTTP_ERROR: Rewards 返回 HTTP {response.status}")
+        raise VerificationError(
+            f"VERIFY_HTTP_ERROR: Rewards 返回 HTTP {response.status}"
+        )
     body = (await page.locator("body").inner_text(timeout=20000)).lower()
-    if any(marker in body for marker in (
-        "captcha", "验证码", "verify you are human", "人机验证", "unusual traffic",
-    )):
-        raise AuthenticationRequired("页面要求人工验证，请在 Windows 浏览器中处理。", code="CHALLENGE_REQUIRED")
+    if any(
+        marker in body
+        for marker in (
+            "captcha",
+            "验证码",
+            "verify you are human",
+            "人机验证",
+            "unusual traffic",
+        )
+    ):
+        raise AuthenticationRequired(
+            "页面要求人工验证，请在 Windows 浏览器中处理。", code="CHALLENGE_REQUIRED"
+        )
     if not body.strip():
-        raise VerificationError("VERIFY_EMPTY_PAGE: Rewards 页面没有可读内容，不能确认登录或完成状态。")
+        raise VerificationError(
+            "VERIFY_EMPTY_PAGE: Rewards 页面没有可读内容，不能确认登录或完成状态。"
+        )
 
 
 async def _write_storage_state(context: BrowserContext, path) -> dict:
@@ -572,7 +927,9 @@ async def _write_storage_state(context: BrowserContext, path) -> dict:
     state = await context.storage_state()
     data = json.dumps(state, ensure_ascii=False).encode("utf-8")
     target = os.path.abspath(path)
-    fd, temp_path = tempfile.mkstemp(prefix=".rewards-state-", dir=os.path.dirname(target))
+    fd, temp_path = tempfile.mkstemp(
+        prefix=".rewards-state-", dir=os.path.dirname(target)
+    )
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
@@ -602,8 +959,11 @@ async def _persist_storage_state(session: BrowserSession) -> None:
     try:
         await _write_storage_state(session.context, session.state_path)
         print(f"    已更新 storage_state：{session.state_path}")
+        _clear_auth_required()
     except Exception as e:
-        raise StorageStateError("AUTH_SAVE_FAILED: 无法保存续期后的登录态，原文件已保留。") from e
+        raise StorageStateError(
+            "AUTH_SAVE_FAILED: 无法保存续期后的登录态，原文件已保留。"
+        ) from e
 
 
 async def _close_session(session: BrowserSession, persist_state: bool = False) -> None:
@@ -624,7 +984,8 @@ def preflight():
     try:
         out = subprocess.run(
             ["tasklist", "/FI", "IMAGENAME eq msedge.exe"],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         ).stdout
         running = "msedge.exe" in out
     except Exception:
@@ -633,13 +994,15 @@ def preflight():
         print("⚠ 检测到 Edge 仍在运行，将强制关闭以保证登录态完整复制。")
         subprocess.run(
             ["taskkill", "/F", "/IM", "msedge.exe"],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
         time.sleep(2)
         try:
             out2 = subprocess.run(
                 ["tasklist", "/FI", "IMAGENAME eq msedge.exe"],
-                capture_output=True, text=True,
+                capture_output=True,
+                text=True,
             ).stdout
             still = "msedge.exe" in out2
         except Exception:
@@ -672,22 +1035,54 @@ def setup_profile(force: bool = False):
     #    排除：缓存目录、历史/图标/自动填充等巨型库、以及整个 Extensions
     #    （uBlock/adguard 等规则集上百 MB，对打卡无用且拖慢启动、可能干扰页面）。
     exclude_dirs = [
-        "Cache", "GPUCache", "Crashpad", "BrowserMetrics", "Service Worker",
-        "Code Cache", "GrShaderCache", "ShaderCache", "optimization_guide",
-        "Subresource Filter", "Site Characteristics Database",
-        "File System", "blob_storage", "IndexedDB", "association",
-        "Extensions", "Extension Rules", "Extension Scripts", "Extension State",
-        "EntityExtraction", "EdgeCoupons", "DawnCache", "DawnGraphiteCache",
-        "DawnWebGPUCache", "AutofillAiModelCache", "discounts_db",
-        "discount_infos_db", "commerce_subscription_db", "EdgeEDrop",
+        "Cache",
+        "GPUCache",
+        "Crashpad",
+        "BrowserMetrics",
+        "Service Worker",
+        "Code Cache",
+        "GrShaderCache",
+        "ShaderCache",
+        "optimization_guide",
+        "Subresource Filter",
+        "Site Characteristics Database",
+        "File System",
+        "blob_storage",
+        "IndexedDB",
+        "association",
+        "Extensions",
+        "Extension Rules",
+        "Extension Scripts",
+        "Extension State",
+        "EntityExtraction",
+        "EdgeCoupons",
+        "DawnCache",
+        "DawnGraphiteCache",
+        "DawnWebGPUCache",
+        "AutofillAiModelCache",
+        "discounts_db",
+        "discount_infos_db",
+        "commerce_subscription_db",
+        "EdgeEDrop",
     ]
     # 大体积但非登录必需的文件（按文件名排除）
     exclude_files = [
-        "History", "Favicons", "Top Sites", "Web Data", "Visited Links",
-        "Shortcuts", "QuotaManager", "QuotaManager-journal",
-        "Cookies-journal", "Network Cookies-journal", "data_reduction_proxy_leveldb",
-        "load_statistics.db", "WebAssistDatabase", "InterestGroups",
-        "Network Action Predictor", "Affiliation Database",
+        "History",
+        "Favicons",
+        "Top Sites",
+        "Web Data",
+        "Visited Links",
+        "Shortcuts",
+        "QuotaManager",
+        "QuotaManager-journal",
+        "Cookies-journal",
+        "Network Cookies-journal",
+        "data_reduction_proxy_leveldb",
+        "load_statistics.db",
+        "WebAssistDatabase",
+        "InterestGroups",
+        "Network Action Predictor",
+        "Affiliation Database",
     ]
     copied = 0
     for name in sorted(os.listdir(SRC_PROFILE)):
@@ -696,10 +1091,20 @@ def setup_profile(force: bool = False):
             dst = os.path.join(PROFILE_DIR, name)
             print(f"  · 复制 {name} ...")
             cmd = [
-                "robocopy", full, dst,
-                "/E", "/R:0", "/W:0", "/NFL", "/NDL", "/NJH", "/NJS",
-                "/XD", *exclude_dirs,
-                "/XF", *exclude_files,
+                "robocopy",
+                full,
+                dst,
+                "/E",
+                "/R:0",
+                "/W:0",
+                "/NFL",
+                "/NDL",
+                "/NJH",
+                "/NJS",
+                "/XD",
+                *exclude_dirs,
+                "/XF",
+                *exclude_files,
             ]
             try:
                 subprocess.run(cmd, check=False, timeout=600)
@@ -732,11 +1137,19 @@ def cleanup_locks():
         except Exception as e:
             print(f"[清理] 删除锁文件失败 {f}: {e}")
 
+
 # 用于搜索任务的随机关键词（模拟真人搜索）
 SEARCH_QUERIES = [
-    "今天的天气", "最新科技新闻", "如何学习 Python", "世界遗产有哪些",
-    "健康饮食建议", "太阳系行星", "北京旅游攻略", "人工智能发展史",
-    "家常菜做法", "提高工作效率的方法",
+    "今天的天气",
+    "最新科技新闻",
+    "如何学习 Python",
+    "世界遗产有哪些",
+    "健康饮食建议",
+    "太阳系行星",
+    "北京旅游攻略",
+    "人工智能发展史",
+    "家常菜做法",
+    "提高工作效率的方法",
 ]
 
 
@@ -749,6 +1162,7 @@ async def human_pause(a: float = 0.4, b: float = 1.2) -> None:
     """D5:统一『人性化等待』——等价 asyncio.sleep(rand(a,b))，风控/阅读节奏集中在这，
     便于整体调抖动区间，避免 54 处各自拍脑袋。调用方只需表达"等 lo~hi 秒"。"""
     await asyncio.sleep(rand(a, b))
+
 
 # 注：human_pause 是 54 处 asyncio.sleep(rand(...)) 的统一出口，
 # 其函数体必须保持 asyncio.sleep(rand(a,b)) 原样（勿被 replace_all 改写成自调用）。
@@ -787,8 +1201,8 @@ async def move_mouse_human(page: Page, tx: float, ty: float):
     steps = random.randint(22, 45)
     for i in range(1, steps + 1):
         t = i / steps
-        x = (1 - t) ** 2 * sx + 2 * (1 - t) * t * mx + t ** 2 * tx
-        y = (1 - t) ** 2 * sy + 2 * (1 - t) * t * my + t ** 2 * ty
+        x = (1 - t) ** 2 * sx + 2 * (1 - t) * t * mx + t**2 * tx
+        y = (1 - t) ** 2 * sy + 2 * (1 - t) * t * my + t**2 * ty
         x += random.uniform(-2.5, 2.5)
         y += random.uniform(-2.5, 2.5)
         await page.mouse.move(x, y)
@@ -802,7 +1216,11 @@ async def click_human(page: Page, locator: Locator):
     await human_pause(0.3, 0.7)
     box = await locator.bounding_box()
     if not box:
-        raise RuntimeError("元素无包围盒，无法点击: " + await locator.to_string() if hasattr(locator, "to_string") else str(locator))
+        raise RuntimeError(
+            "元素无包围盒，无法点击: " + await locator.to_string()
+            if hasattr(locator, "to_string")
+            else str(locator)
+        )
     # 点击元素内部随机一点（非死板正中心）
     cx = box["x"] + box["width"] * random.uniform(0.3, 0.7)
     cy = box["y"] + box["height"] * random.uniform(0.35, 0.65)
@@ -855,7 +1273,9 @@ async def perform_search_on_page(page: Page):
     if not box:
         return
     await click_human(page, page.locator("#sb_form_q"))
-    await page.keyboard.type(random.choice(SEARCH_QUERIES), delay=random.uniform(60, 160))
+    await page.keyboard.type(
+        random.choice(SEARCH_QUERIES), delay=random.uniform(60, 160)
+    )
     await human_pause(0.3, 0.8)
     await page.keyboard.press("Enter")
     await human_pause(2.5, 4.5)
@@ -891,9 +1311,12 @@ async def handle_quiz(np: Page):
     # 只用 Bing quiz 专属的答案选项 class，避免命中搜索结果页里的普通按钮
     # （div[role='button'] / a[role='button'] 太宽，会误点搜索框、菜单等）
     option_selectors = [
-        "[class*='rqAnswerOption' i]", "[class*='answerOption' i]",
-        "[class*='b_ans' i] a", "[class*='quizOption' i]",
-        "[class*='option' i]", "[class*='answer' i]",
+        "[class*='rqAnswerOption' i]",
+        "[class*='answerOption' i]",
+        "[class*='b_ans' i] a",
+        "[class*='quizOption' i]",
+        "[class*='option' i]",
+        "[class*='answer' i]",
     ]
 
     def frames():
@@ -917,13 +1340,24 @@ async def handle_quiz(np: Page):
         return
 
     # 终态标记：出现即代表整份测验已答完，应立即停止点选（避免无脑点满多轮）
-    _terminal_markers = ["已完成", "查看成绩", "你已完成", "完成!", "全部完成",
-                         "view your score", "quiz complete", "you completed",
-                         "see your score", "成绩"]
+    _terminal_markers = [
+        "已完成",
+        "查看成绩",
+        "你已完成",
+        "完成!",
+        "全部完成",
+        "view your score",
+        "quiz complete",
+        "you completed",
+        "see your score",
+        "成绩",
+    ]
 
     async def _is_terminal():
         try:
-            txt = await np.evaluate("() => document.body ? document.body.innerText : ''")
+            txt = await np.evaluate(
+                "() => document.body ? document.body.innerText : ''"
+            )
         except Exception:
             return False
         low = txt.lower()
@@ -989,8 +1423,16 @@ async def _has_real_quiz_elements(np: Page) -> bool:
     # 注意：「b_ans」是必应通用答案框（knowledge/answer box）的 class，普通搜索结果页
     # 几乎都带它，并非问答(quiz)。把它当 quiz 信号会把搜索页误判成内嵌问答，进而被送进
     # handle_puzzle_or_quiz 的拼图/点选流程（见 ADR-0003）。仅保留 quiz 专属 class。
-    markers = ["rqansweroption", "answeroption", "officequiz", "welcomequiz",
-               "quizoption", "quizcontainer", "btcorpus", "fyestrivia"]
+    markers = [
+        "rqansweroption",
+        "answeroption",
+        "officequiz",
+        "welcomequiz",
+        "quizoption",
+        "quizcontainer",
+        "btcorpus",
+        "fyestrivia",
+    ]
     return any(m in low for m in markers)
 
 
@@ -1012,15 +1454,21 @@ async def handle_puzzle_or_quiz(np: Page) -> bool:
     is_puzzle = ("imagepuzzle" in low_url) or ("puzzle" in low_url)
     if not is_puzzle:
         try:
-            if (await np.locator("#skipPuzzle").count() > 0
-                    or await np.locator("text=跳过拼图").count() > 0):
+            if (
+                await np.locator("#skipPuzzle").count() > 0
+                or await np.locator("text=跳过拼图").count() > 0
+            ):
                 is_puzzle = True
         except Exception:
             pass
     # 注意：不能用裸「问题/question」判定——中文/必应搜索结果页到处是这些词，会被误判成 quiz 去点选答案。
     # 仅当页面含明确的测验信号：URL 含 quiz / 文案含「你是否知道」「测验」/ 或真含问答容器 class。
-    is_quiz = ("quiz" in low_url) or ("你是否知道" in content) or ("测验" in content) \
+    is_quiz = (
+        ("quiz" in low_url)
+        or ("你是否知道" in content)
+        or ("测验" in content)
         or (await _has_real_quiz_elements(np))
+    )
     if not (is_puzzle or is_quiz):
         return False
 
@@ -1070,9 +1518,15 @@ async def handle_puzzle_or_quiz(np: Page) -> bool:
             except Exception:
                 continue
         target = None
-        for sel in ["canvas", "img[class*='puzzle' i]", "[class*='puzzle' i]",
-                    "[class*='tile' i]", "#currentQuestionContainer",
-                    "[class*='question' i]", "[class*='option' i]"]:
+        for sel in [
+            "canvas",
+            "img[class*='puzzle' i]",
+            "[class*='puzzle' i]",
+            "[class*='tile' i]",
+            "#currentQuestionContainer",
+            "[class*='question' i]",
+            "[class*='option' i]",
+        ]:
             loc = np.locator(sel).first
             try:
                 if await loc.count() > 0 and await loc.is_visible():
@@ -1115,9 +1569,17 @@ async def handle_puzzle_or_quiz(np: Page) -> bool:
 # ====================== 卡片/弹层识别 ======================
 # 非任务的导航/杂项链接特征（小写匹配）
 NAV_MARKERS = [
-    "/dashboard", "/redeem", "/about", "/refer", "/faq",
-    "/orderhistory", "/sitemap", "/account/", "/earn?modal=",
-    "rwgbopen=1", "support.microsoft.com",
+    "/dashboard",
+    "/redeem",
+    "/about",
+    "/refer",
+    "/faq",
+    "/orderhistory",
+    "/sitemap",
+    "/account/",
+    "/earn?modal=",
+    "rwgbopen=1",
+    "support.microsoft.com",
 ]
 
 
@@ -1126,7 +1588,11 @@ def is_nav_link(h: str) -> bool:
     if any(m in low for m in NAV_MARKERS):
         return True
     # 纯首页 / 自身链接
-    if low.rstrip("/") in ("https://rewards.bing.com", "https://www.bing.com", "https://bing.com"):
+    if low.rstrip("/") in (
+        "https://rewards.bing.com",
+        "https://www.bing.com",
+        "https://bing.com",
+    ):
         return True
     if low.rstrip("/") == EARN_URL.rstrip("/").lower():
         return True
@@ -1182,13 +1648,16 @@ async def click_offer(page: Page, href: str, source_url: str = EARN_URL):
     CSS 选择器 a[href="..."] 精确匹配失败（曾导致「未能定位/打开该活动」）。
     依据 target 属性判断：有 _blank 必弹新标签；否则同页跳转。
     """
-    info = await page.evaluate("""(h) => {
+    info = await page.evaluate(
+        """(h) => {
         const els = Array.from(document.querySelectorAll('a[href]'));
         const m = els.find(a => a.href === h);
         if (!m) return null;
         m.setAttribute('data-offer-target', '1');
         return { tb: (m.getAttribute('target') || '').toLowerCase() };
-    }""", href)
+    }""",
+        href,
+    )
     if info is None:
         return None, False, "no-link"
     link = page.locator(SELECTORS["A_TARGET"]).first
@@ -1347,7 +1816,9 @@ async def task_dashboard_activities(page: Page, context: BrowserContext):
             if same_tab:
                 # 同页跳转：重载 dashboard 以返回并刷新状态
                 try:
-                    await page.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=60000)
+                    await page.goto(
+                        DASHBOARD_URL, wait_until="domcontentloaded", timeout=60000
+                    )
                     await page.wait_for_timeout(3000)
                 except Exception:
                     pass
@@ -1357,10 +1828,14 @@ async def task_dashboard_activities(page: Page, context: BrowserContext):
                 except Exception:
                     pass
         await human_pause(1.5, 3.0)
-    print("    其它 dashboard 任务处理完成（每日活动由 task_dashboard_daily_set 专项处理）")
+    print(
+        "    其它 dashboard 任务处理完成（每日活动由 task_dashboard_daily_set 专项处理）"
+    )
 
 
-async def task_dashboard_daily_set(page: Page, context: BrowserContext = None, log=None):
+async def task_dashboard_daily_set(
+    page: Page, context: BrowserContext = None, log=None
+):
     """2b. 每日活动三张卡片 + 「可领取」奖励积分：专属于 dashboard 的 SPA 流程。
 
     修复审计盲区（为什么「每日活动没做完却没被审计到」）：
@@ -1384,7 +1859,9 @@ async def task_dashboard_daily_set(page: Page, context: BrowserContext = None, l
     panel = None
     try:
         h2 = page.locator("h2", has_text="每日活动").first
-        discl = h2.locator("xpath=ancestor::div[contains(@class,'react-aria-Disclosure')]").first
+        discl = h2.locator(
+            "xpath=ancestor::div[contains(@class,'react-aria-Disclosure')]"
+        ).first
         panel = discl.locator("div.react-aria-DisclosurePanel").first
         # 确保折叠区已展开（aria-expanded=false 时需先点开，否则卡片不在 DOM 中）
         try:
@@ -1419,7 +1896,7 @@ async def task_dashboard_daily_set(page: Page, context: BrowserContext = None, l
         if "已完成" in txt:
             done += 1
             continue
-        log(f"[daily_set] 处理第 {idx+1}/{total} 张每日活动卡片 ...")
+        log(f"[daily_set] 处理第 {idx + 1}/{total} 张每日活动卡片 ...")
         try:
             async with ctx.expect_page(timeout=8000) as pop:
                 try:
@@ -1444,7 +1921,9 @@ async def task_dashboard_daily_set(page: Page, context: BrowserContext = None, l
             await page.wait_for_timeout(4000)
             try:
                 if DASHBOARD_URL.rstrip("/") not in page.url:
-                    await page.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=60000)
+                    await page.goto(
+                        DASHBOARD_URL, wait_until="domcontentloaded", timeout=60000
+                    )
                     await page.wait_for_timeout(2000)
             except Exception:
                 pass
@@ -1460,9 +1939,9 @@ async def task_dashboard_daily_set(page: Page, context: BrowserContext = None, l
             await page.wait_for_timeout(1500)
         if ok:
             done += 1
-            log(f"[daily_set] 第 {idx+1} 张卡片已完成 ✓")
+            log(f"[daily_set] 第 {idx + 1} 张卡片已完成 ✓")
         else:
-            log(f"[daily_set] 第 {idx+1} 张卡片点击后未检测到「已完成」标记")
+            log(f"[daily_set] 第 {idx + 1} 张卡片点击后未检测到「已完成」标记")
 
     # —— 领取「可领取」奖励积分 ——
     claimed = 0
@@ -1494,19 +1973,23 @@ async def task_dashboard_daily_set(page: Page, context: BrowserContext = None, l
                     claim2 = None
                     if fly is not None:
                         # flyout 内的「领取积分」：优先 button/可点击元素，再退化为任意含该文字的元素
-                        for sel in ["button:has-text('领取积分')",
-                                    "a:has-text('领取积分')",
-                                    "div:has-text('领取积分')",
-                                    "text=领取积分"]:
+                        for sel in [
+                            "button:has-text('领取积分')",
+                            "a:has-text('领取积分')",
+                            "div:has-text('领取积分')",
+                            "text=领取积分",
+                        ]:
                             cand = fly.locator(sel).first
                             if await cand.count() and await cand.is_visible():
                                 claim2 = cand
                                 break
                     if claim2 is None:
                         # flyout 内没找到，退化为页面级（并放宽到含「领取」的可点击元素）
-                        for sel in ["button:has-text('领取')",
-                                    "a:has-text('领取')",
-                                    "text=领取积分"]:
+                        for sel in [
+                            "button:has-text('领取')",
+                            "a:has-text('领取')",
+                            "text=领取积分",
+                        ]:
                             cand = page.locator(sel).first
                             if await cand.count() and await cand.is_visible():
                                 claim2 = cand
@@ -1523,8 +2006,11 @@ async def task_dashboard_daily_set(page: Page, context: BrowserContext = None, l
                         if f2 is not None:
                             html = await f2.inner_html()
                             import os as _os
+
                             _os.makedirs("dbg", exist_ok=True)
-                            with open("dbg/dbg_claim_flyout.html", "w", encoding="utf-8") as _fh:
+                            with open(
+                                "dbg/dbg_claim_flyout.html", "w", encoding="utf-8"
+                            ) as _fh:
                                 _fh.write(html)
                     except Exception:
                         pass
@@ -1569,7 +2055,7 @@ async def task_monthly_strategy(page: Page, context: BrowserContext):
     for o in offers:
         if is_monthly_strategy(o.get("text", ""), o.get("href", "")):
             july_href = o.get("href", "")
-            card = page.locator('a[href*="BingMonthlyPC"]').first
+            card = page.locator(f'a[href="{july_href}"]').first
             break
     if card is None:
         print("    未找到本月攻略卡片（定位器零匹配）——结构级异常，已计入告警")
@@ -1617,30 +2103,32 @@ async def task_monthly_strategy(page: Page, context: BrowserContext):
                 }
                 // 从三类种子元素向上收敛到「周任务行」容器，再按容器去重：
                 //  绿勾徽章、锁图标、行内跳转搜索链接（h3 不再是唯一入口）。
-                const seeds = Array.from(document.querySelectorAll(
-                    '[class*="statusSuccessRewardsBg"], [class*="lock" i]:not([class*="unlock" i]), a[href*="bing.com/search"]'
-                ));
+                 const seeds = Array.from(document.querySelectorAll(
+                     'h3, h4, [class*="lock" i]:not([class*="unlock" i]), a[href], button'
+                 ));
                 const rows = [];
                 const seen = new Set();
-                for (const el of seeds) {
-                    let row = el;
-                    for (let i = 0; i < 8 && row; i++) {
-                        const rhtml = row.innerHTML || '';
-                        const rcls = row.className || '';
-                        // 收敛为「同时含有状态图标 + 文本 +（可选）搜索链接」的最小行容器
-                        const hasBadge = /statusSuccessRewardsBg|ctrlChoiceBaseStroke/.test(rhtml)
-                            || row.querySelector('a[href*="bing.com/search"]')
-                            || /rewardsCard|rewardsModule|disclosure|item-|module|quest|punchcard|rewardRow|d1c/.test(rcls);
-                        const hasText = (row.innerText || '').trim().length > 0;
-                        if (hasBadge && hasText) break;
-                        row = row.parentElement;
-                    }
-                    if (!row || seen.has(row)) continue;
+                 for (const el of seeds) {
+                     let row = el;
+                     let candidate = null;
+                     for (let i = 0; i < 8 && row; i++) {
+                         const headings = row.querySelectorAll('h3, h4');
+                         // 周任务行只含一个标题。再向上会包住相邻的锁图标，导致开放周误判锁定。
+                         if (headings.length > 1) break;
+                         const rhtml = row.innerHTML || '';
+                         const hasStatus = /statusSuccessRewardsBg|["' ]lock/i.test(rhtml)
+                             || row.querySelector('a[href], button');
+                         if (hasStatus && row !== el) candidate = row;
+                         row = row.parentElement;
+                     }
+                     row = candidate;
+                     if (!row || seen.has(row)) continue;
+                     if (!/statusSuccessRewardsBg|["' ]lock/i.test(row.innerHTML || '')
+                         && !row.querySelector('a[href], button')) continue;
                     seen.add(row);
                     const rhtml = row.innerHTML || '';
                     const rtext = (row.innerText || '').replace(/\s+/g, ' ');
                     const green = GREEN.test(rhtml) || GREEN.test(rtext);
-                    const lockHit = LOCK_TXT.test(rtext) || hasLockIcon(row);
                     // 周任务跳转链接：优先「_blank + bing.com/search」直链，逐层放宽到
                     // rewards.bing.com 内 search/quest 形式、乃至行内任意非导航 <a href>，
                     // 避免「周链接 host 不是 bing.com/search 字面量」时取到空 href 而不被点击。
@@ -1649,8 +2137,20 @@ async def task_monthly_strategy(page: Page, context: BrowserContext):
                             || row.querySelector('a[target="_blank"][href*="search"]')
                             || row.querySelector('a[href*="search"]')
                             || row.querySelector('a[href*="quest"]')
-                            || row.querySelector('a:not([href^="#"]):not([href=""])');
+                            || row.querySelector('a:not([href^="#"]):not([href=""])')
+                            || row.querySelector('button');
                     const href = cand ? cand.href : '';
+                    // 微软会在“已开放”的行文案中写“完成第 2 天后等待 24 小时”。
+                    // 这不是锁定状态；只要行内存在启用的前往链接，就以按钮状态为准。
+                    const enabledAction = !!cand
+                        && !cand.hasAttribute('disabled')
+                        && cand.getAttribute('aria-disabled') !== 'true';
+                    const disabledAction = !!cand
+                        && !enabledAction
+                        && (cand.hasAttribute('disabled')
+                            || cand.getAttribute('aria-disabled') === 'true');
+                    const lockHit = hasLockIcon(row)
+                        || (LOCK_TXT.test(rtext) && !enabledAction && !disabledAction);
                     const allLinks = Array.from(row.querySelectorAll('a[href]'))
                         .map(a => (a.href || '')).filter(Boolean);
                     const title = (row.querySelector('h3, p[class*="Strong"], [class*="globalBody2Strong"], span[class*="body"]')?.innerText
@@ -1660,8 +2160,10 @@ async def task_monthly_strategy(page: Page, context: BrowserContext):
                         locked: lockHit && !green,
                         href,
                         title,
+                        text: rtext,
                         links: allLinks.slice(0, 8),
-                        no_href: !href,
+                        no_href: !href || !enabledAction,
+                        actionable: enabledAction || !!row.querySelector('button'),
                     });
                 }
                 // 稳定去抖：同一 title 重复出现的容器只留一个
@@ -1671,11 +2173,44 @@ async def task_monthly_strategy(page: Page, context: BrowserContext):
             }""")
 
         rows = await scan_punchcard_rows(target)
+        # 已经手工完成过第一天、但本地尚无门控状态时，先从现在开始计 24 小时，
+        # 避免把未知的上次搜索时间当成可立即重复搜索。
+        for daily_row in rows:
+            daily_text = daily_row.get("text", "")
+            daily_done, daily_total = parse_monthly_daily_progress(daily_text)
+            if (
+                is_monthly_daily_search(daily_text)
+                and daily_done
+                and daily_done < (daily_total or 0)
+                and not isinstance(
+                    _load_json(_monthly_daily_state_path(), {}).get("last_search_at"),
+                    (int, float),
+                )
+            ):
+                mark_monthly_daily_search()
+                print(
+                    "    月度每日搜索已存在历史进度，首次建立 24 小时门控，今天不重复点击"
+                )
+                break
         weekly_done = sum(1 for r in rows if r["done"])
         weekly_locked = sum(1 for r in rows if r["locked"])
         weekly_open = len(rows) - weekly_locked
-        _write_monthly_state(weekly_done, weekly_open)
-        print(f"    本月攻略共 {len(rows)} 个周任务行（含锁定未开放 {weekly_locked} 个）")
+        _write_monthly_state(
+            weekly_done,
+            weekly_scanned=len(rows),
+            weekly_locked=weekly_locked,
+            weekly_total=max(1, len(rows)),
+        )
+        print(
+            f"    本月攻略共 {len(rows)} 个周任务行（含锁定未开放 {weekly_locked} 个）"
+        )
+        expected_rows = (
+            current_month_week_index() if len(rows) == MONTHLY_TOTAL_WEEKS else 1
+        )
+        if len(rows) < expected_rows:
+            run_state.structural_failures.append(
+                f"本月攻略周任务行扫描不足：仅识别 {len(rows)} 行，当前应至少可见第 {expected_rows} 周"
+            )
         for i, r in enumerate(rows):
             if r["done"]:
                 mark = "✓绿勾"
@@ -1691,23 +2226,41 @@ async def task_monthly_strategy(page: Page, context: BrowserContext):
         # 无法提取到前往链接的开放周（no_href）不静默跳过，而是写入复检清单，避免漏做。
         uniq = [r for r in rows if not r["done"] and not r["locked"]]
         blockers = [r for r in uniq if r["no_href"]]
-        doable = [r for r in uniq if r["href"]]
+        doable = [r for r in uniq if r["href"] and r.get("actionable", True)]
         if blockers:
             for b in blockers:
-                print(f"    ⚠ 开放周「{b['title'][:30]}」href 提取失败，本轮无法点击，已记入复检清单")
-                run_state.unfinished.append(f"{b['title'][:40]}  [周前往链接提取失败/为空]")
-        print(f"    其中未勾选且非锁定的开放周：{len(uniq)} 个（可合法点击 {len(doable)}，待排查 {len(blockers)}）")
-        for r in doable:
-            if not week_gate_ok(r["title"]):
+                print(
+                    f"    ⚠ 开放周「{b['title'][:30]}」href 提取失败，本轮无法点击，已记入复检清单"
+                )
+                run_state.unfinished.append(
+                    f"{b['title'][:40]}  [周前往链接提取失败/为空]"
+                )
+        print(
+            f"    其中未勾选且非锁定的开放周：{len(uniq)} 个（可合法点击 {len(doable)}，待排查 {len(blockers)}）"
+        )
+        # 页面按周只会开放一个蓝色“前往”按钮；本轮最多点击一个，
+        # 防止延迟入账或微软页面重复渲染导致同一月度任务被连续触发。
+        for r in doable[:1]:
+            daily_task = is_monthly_daily_search(r.get("text", "") or r["title"])
+            daily_before_text = r.get("text", "") if daily_task else ""
+            if daily_task and not monthly_daily_search_allowed():
+                print(
+                    f"    ⏭ 月度每日搜索门控：距上次搜索未满 24 小时，跳过 {r['title'][:30]}"
+                )
+                continue
+            if not daily_task and not week_gate_ok(r["title"]):
                 print(f"    ⏭ 周门控跳过：{r['title'][:30]}（本周已处理过）")
                 continue
             print(f"  ▶ 真人点击未勾选周任务：{r['title'][:30]}  ->  {r['href'][:60]}")
-            week_mark_clicked(r["title"])  # 记录"已在本周点击过"，供周门控防重复
+            if not daily_task:
+                week_mark_clicked(r["title"])  # 记录"已在本周点击过"，供周门控防重复
             # 用 Locator 按绝对 href 定位（比 evaluate_handle 更稳），真人点击弹出搜索页
             sp = None
             link = target.locator(f'a[href="{r["href"]}"]').first
             if await link.count() > 0:
-                sp = await click_link_get_popup(target, link)  # 内部 expect_popup(8000) + 真人点击
+                sp = await click_link_get_popup(
+                    target, link
+                )  # 内部 expect_popup(8000) + 真人点击
             if sp is None:
                 # 回退 1：宽松选择器 + 更长超时（复用统一弹出原语，放宽到 15s）
                 link2 = target.locator(f'a[href*="{SELECTORS["SEARCH_HREF"]}"]').first
@@ -1725,10 +2278,15 @@ async def task_monthly_strategy(page: Page, context: BrowserContext):
                 print("      ⚠ 仍未能弹出搜索页，回退新标签 goto 兜底（可能不计分）")
                 np = await context.new_page()
                 try:
-                    await np.goto(r["href"], wait_until="domcontentloaded", timeout=30000)
+                    await np.goto(
+                        r["href"], wait_until="domcontentloaded", timeout=30000
+                    )
                     await humanize_read(np)
                 finally:
                     await np.close()
+            if daily_task:
+                mark_monthly_daily_search()
+                print("      ✓ 已记录本次月度每日搜索，下一次至少间隔 24 小时")
             # 单周完成闭环校验：reload punchcard 页再扫一次，确认该周绿勾翻转
             # 区分「点击了但微软不计分」与「压根没点到」，对应 ADR-0002 的涨分自审思路
             await human_pause(1.5, 3.0)
@@ -1736,29 +2294,65 @@ async def task_monthly_strategy(page: Page, context: BrowserContext):
                 await target.reload(wait_until="domcontentloaded")
                 await target.wait_for_timeout(4000)
                 rows_chk = await scan_punchcard_rows(target)
-                matched = next((x for x in rows_chk
-                                if x["title"][:20] == r["title"][:20]), None)
-                if matched and matched["done"]:
+                matched = next(
+                    (x for x in rows_chk if x["title"][:20] == r["title"][:20]), None
+                )
+                if daily_task and matched:
+                    before_progress = parse_monthly_daily_progress(daily_before_text)
+                    after_progress = parse_monthly_daily_progress(
+                        matched.get("text", "")
+                    )
+                    if monthly_daily_progress_advanced(
+                        daily_before_text, matched.get("text", "")
+                    ):
+                        print(
+                            f"      ✓ 月度每日搜索进度已递增：{before_progress[0]}/{before_progress[1]} -> {after_progress[0]}/{after_progress[1]} days complete"
+                        )
+                    else:
+                        print(
+                            f"      ⚠ 月度每日搜索进度未确认递增：{before_progress[0]}/{before_progress[1]} -> {after_progress[0]}/{after_progress[1]} days complete"
+                        )
+                        run_state.unfinished.append(
+                            f"{r['title'][:40]} [搜索后进度未从 {before_progress[0]}/{before_progress[1]} 递增]"
+                        )
+                elif matched and matched["done"]:
                     print(f"      ✓ 单周校验通过：{r['title'][:30]} 已翻转为绿勾")
                     week_mark_done(r["title"])  # 翻绿后本周期内不再碰
                 else:
-                    print(f"      ⚠ 单周校验失败：{r['title'][:30]} 点击后仍未标记完成（可能计入延迟，本周不再重复点）")
+                    print(
+                        f"      ⚠ 单周校验失败：{r['title'][:30]} 点击后仍未标记完成（可能计入延迟，本周不再重复点）"
+                    )
             except Exception as e:
                 print(f"      （单周校验异常：{e}）")
+        if len(doable) > 1:
+            print(
+                f"    本轮仅处理第一个启用周任务，其余 {len(doable) - 1} 个留待下次复检"
+            )
         # 处理完刷新 punchcard 页（DOM 需重载才反映新绿勾），再读一次状态确认
         try:
             await target.reload(wait_until="domcontentloaded")
             await target.wait_for_timeout(4000)
         except Exception:
             try:
-                await target.goto(target.url, wait_until="domcontentloaded", timeout=60000)
+                await target.goto(
+                    target.url, wait_until="domcontentloaded", timeout=60000
+                )
                 await target.wait_for_timeout(4000)
             except Exception:
                 pass
         try:
             rows2 = await scan_punchcard_rows(target)
             done_cnt = sum(1 for x in rows2 if x["done"])
-            print(f"    本月攻略周任务总计 {len(rows2)}，已勾选(绿勾) {done_cnt}，未勾选 {len(rows2) - done_cnt}")
+            locked_cnt = sum(1 for x in rows2 if x["locked"])
+            _write_monthly_state(
+                done_cnt,
+                weekly_scanned=len(rows2),
+                weekly_locked=locked_cnt,
+                weekly_total=max(1, len(rows2)),
+            )
+            print(
+                f"    本月攻略周任务总计 {len(rows2)}，已勾选(绿勾) {done_cnt}，未勾选 {len(rows2) - done_cnt}"
+            )
         except Exception:
             pass
     finally:
@@ -1915,7 +2509,15 @@ async def click_card_open_flyout(page: Page, card: Locator):
     await click_human(page, card)
     await human_pause(1.0, 2.0)
     if await find_flyout(page) is None:
-        for label in ["开始", "继续", "立即开始", "了解更多", "去完成", "参与", "立即参与"]:
+        for label in [
+            "开始",
+            "继续",
+            "立即开始",
+            "了解更多",
+            "去完成",
+            "参与",
+            "立即参与",
+        ]:
             btn = card.locator("a,button").filter(has_text=label).first
             if await btn.count() > 0:
                 try:
@@ -1928,10 +2530,16 @@ async def click_card_open_flyout(page: Page, card: Locator):
 
 async def find_flyout(page: Page) -> Locator | None:
     """侧边弹出的详情面板（多种兜底）"""
-    for sel in ["#rewardsFlyout", ".flyout", "[role='dialog']",
-                "div[class*='flyout' i]", "div[class*='drawer' i]",
-                "div[class*='panel' i]", "div[class*='modal' i]",
-                "div[class*='sidebar' i]"]:
+    for sel in [
+        "#rewardsFlyout",
+        ".flyout",
+        "[role='dialog']",
+        "div[class*='flyout' i]",
+        "div[class*='drawer' i]",
+        "div[class*='panel' i]",
+        "div[class*='modal' i]",
+        "div[class*='sidebar' i]",
+    ]:
         loc = page.locator(sel).first
         try:
             if await loc.count() > 0 and await loc.is_visible():
@@ -1941,7 +2549,9 @@ async def find_flyout(page: Page) -> Locator | None:
     return None
 
 
-async def click_link_get_popup(page: Page, link: Locator, timeout: int = 8000) -> Page | None:
+async def click_link_get_popup(
+    page: Page, link: Locator, timeout: int = 8000
+) -> Page | None:
     """真人鼠标点击一个链接/卡片元素，返回它弹出的新标签页（无则 None）。
 
     这是「模仿真人从 Rewards 页点击卡片」的**唯一弹出原语**（D2）：
@@ -2019,7 +2629,14 @@ async def task_search_card(page: Page, context: BrowserContext):
     if not hrefs:
         after = await collect_hrefs(page)
         hrefs = [h for h in after if h not in before]
-    link = next((h for h in hrefs if not is_nav_link(h) and ("bing.com" in h or "search" in h.lower())), None)
+    link = next(
+        (
+            h
+            for h in hrefs
+            if not is_nav_link(h) and ("bing.com" in h or "search" in h.lower())
+        ),
+        None,
+    )
     if not link:
         print("    未找到搜索跳转链接，跳过")
         return
@@ -2072,11 +2689,11 @@ async def debug_dump(page: Page):
         return out;
     }""")
     print(f"候选卡片数: {len(data['cards'])}")
-    for i, c in enumerate(data['cards'][:40]):
+    for i, c in enumerate(data["cards"][:40]):
         print(f"  [{i}] cls={c['cls']}")
         print(f"      text={c['text']}")
     print(f"相关链接数: {len(data['links'])}")
-    for i, l in enumerate(data['links'][:50]):
+    for i, l in enumerate(data["links"][:50]):
         print(f"  ({i}) {l['text']}  ->  {l['href']}")
     # 同时打印「可处理任务」清单（按真实 <a href> 提取，不依赖卡片容器）
     try:
@@ -2119,7 +2736,9 @@ async def _scan_unfinished(page: Page) -> list:
     task_count = 0
     for url in (DASHBOARD_URL, EARN_URL):
         try:
-            response = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            response = await page.goto(
+                url, wait_until="domcontentloaded", timeout=60000
+            )
             await page.wait_for_timeout(3500)
             await _require_rewards_page(page, response)
             raw = await collect_offers(page)
@@ -2128,7 +2747,9 @@ async def _scan_unfinished(page: Page) -> list:
         except (AuthenticationRequired, VerificationError):
             raise
         except Exception as e:
-            raise VerificationError(f"VERIFY_FAILED: 无法完成 {url} 的复检（{type(e).__name__}）。") from e
+            raise VerificationError(
+                f"VERIFY_FAILED: 无法完成 {url} 的复检（{type(e).__name__}）。"
+            ) from e
         for o in raw:
             if is_nav_link(o["href"]) or not o["text"]:
                 continue
@@ -2220,7 +2841,9 @@ async def verify_and_retry(page: Page, context: BrowserContext):
     still = await _scan_unfinished(page)
     run_state.unfinished.extend(f"{o['text'][:40]}  [{o['href'][:70]}]" for o in still)
     if run_state.unfinished:
-        print(f"    ⚠ 重试后仍有 {len(run_state.unfinished)} 项未完成，将写入结果邮件：")
+        print(
+            f"    ⚠ 重试后仍有 {len(run_state.unfinished)} 项未完成，将写入结果邮件："
+        )
         for t in run_state.unfinished:
             print(f"      · {t}")
     else:
@@ -2238,7 +2861,9 @@ async def _launch_context(p) -> BrowserSession:
         print("启动 Chromium（headless，复用完整 storage_state 登录态）...")
         state = _read_storage_state(NAS_STORAGE_STATE)
         if not state["cookies"]:
-            raise StorageStateError("AUTH_IMPORT_INVALID: 登录态中没有 cookies，请重新导出。")
+            raise StorageStateError(
+                "AUTH_IMPORT_INVALID: 登录态中没有 cookies，请重新导出。"
+            )
         print(
             f"    载入登录态（cookies + origins）：{NAS_STORAGE_STATE} "
             f"（{len(state['cookies'])} cookies，{len(state['origins'])} origins）"
@@ -2359,11 +2984,15 @@ async def main():
             await dismiss_edge_sync_prompt(context)
             print("正在打开:", EARN_URL)
             try:
-                response = await page.goto(EARN_URL, wait_until="domcontentloaded", timeout=120000)
+                response = await page.goto(
+                    EARN_URL, wait_until="domcontentloaded", timeout=120000
+                )
             except Exception as e:
                 if _is_auth_wall_url(page.url):
                     raise _auth_error(page.url) from None
-                raise VerificationError(f"NAVIGATION_FAILED: 打开 Rewards 失败（{type(e).__name__}）。") from e
+                raise VerificationError(
+                    f"NAVIGATION_FAILED: 打开 Rewards 失败（{type(e).__name__}）。"
+                ) from e
             # networkidle 在重 SPA 上易卡死，改用显式等待关键元素
             await page.wait_for_timeout(5000)
             # 导航后再次尝试关闭同步提示（部分情况下在 new-tab 页才弹出）
@@ -2376,11 +3005,17 @@ async def main():
                 if IS_NAS:
                     print("⚠ NAS 模式检测到登录/重新认证页面，无法交互处理。")
                     raise _auth_error(page.url)
-                print("⚠ 页面跳转到登录/重新认证页面：复制的 profile 未携带可用登录态。")
+                print(
+                    "⚠ 页面跳转到登录/重新认证页面：复制的 profile 未携带可用登录态。"
+                )
                 print("   请在打开的浏览器中手动登录 Microsoft 账户，")
-                print("   如出现账户条款页面，请先完成人工确认；进入 Rewards 页面后回到此处按 Enter。")
+                print(
+                    "   如出现账户条款页面，请先完成人工确认；进入 Rewards 页面后回到此处按 Enter。"
+                )
                 input("   登录完成后按 Enter 继续...")
-                response = await page.goto(EARN_URL, wait_until="domcontentloaded", timeout=120000)
+                response = await page.goto(
+                    EARN_URL, wait_until="domcontentloaded", timeout=120000
+                )
                 await page.wait_for_timeout(6000)
                 print("重新打开后 URL:", _display_url(page.url))
                 if _is_auth_wall_url(page.url):
@@ -2407,9 +3042,13 @@ async def main():
             await human_pause(1.0, 2.0)
             # 每日活动三张卡片：专门处理（逐卡校验「已完成」+ 领取「可领取」奖励积分）
             try:
-                run_state.daily_set_result = await task_dashboard_daily_set(page, context)
-                print(f"[每日活动] 完成 {run_state.daily_set_result['done']}/{run_state.daily_set_result['total']} 张，"
-                      f"本次领取奖励积分 {run_state.daily_set_result['claimed']}")
+                run_state.daily_set_result = await task_dashboard_daily_set(
+                    page, context
+                )
+                print(
+                    f"[每日活动] 完成 {run_state.daily_set_result['done']}/{run_state.daily_set_result['total']} 张，"
+                    f"本次领取奖励积分 {run_state.daily_set_result['claimed']}"
+                )
             except Exception as e:
                 print(f"  ✗ 每日活动专处理异常: {e}")
             await human_pause(1.0, 2.0)
@@ -2447,6 +3086,8 @@ async def main():
         except AuthenticationRequired as e:
             run_state.last_run_failed = True
             session.authenticated = False
+            e.url = page.url if page is not None else ""
+            _mark_auth_required(e)
             print("主流程认证失败:", e)
             try:
                 await page.screenshot(path="debug_auth_error.png", full_page=True)
@@ -2491,60 +3132,106 @@ async def export_storage_state():
     setup_profile(force=not reuse_profile)
     cleanup_locks()
     async with async_playwright() as p:
-        context: BrowserContext = await p.chromium.launch_persistent_context(
-            user_data_dir=PROFILE_DIR,
-            channel="msedge",
-            headless=HEADLESS,
-            timeout=60000,
-            slow_mo=300,
-            args=["--start-maximized", "--no-first-run", "--no-default-browser-check"],
-        )
+
+        async def launch_export_context() -> BrowserContext:
+            return await p.chromium.launch_persistent_context(
+                user_data_dir=PROFILE_DIR,
+                channel="msedge",
+                headless=HEADLESS,
+                timeout=60000,
+                slow_mo=300,
+                args=[
+                    "--start-maximized",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                ],
+            )
+
+        context: BrowserContext = await launch_export_context()
         try:
             page = context.pages[0] if context.pages else await context.new_page()
             try:
-                response = await page.goto(EARN_URL, wait_until="domcontentloaded", timeout=120000)
+                response = await page.goto(
+                    EARN_URL, wait_until="domcontentloaded", timeout=120000
+                )
             except Exception as first_error:
                 # Edge 首次启动时可能因初始空白页/扩展重定向竞争返回 ERR_ABORTED；
                 # 先等待当前导航落地，再用 commit 导航重试，避免把可恢复中断当成登录失败。
                 if "ERR_ABORTED" not in str(first_error):
                     raise
-                print(f"[导出] 首次导航被 Edge 中断（ERR_ABORTED），等待后重试：{page.url}")
-                # ERR_ABORTED 可能同时关闭原始 about:blank page，不能继续复用它。
+                print(
+                    f"[导出] 首次导航被 Edge 中断（ERR_ABORTED），等待后重试：{page.url}"
+                )
+                # ERR_ABORTED 可能同时关闭整个 Context；必须重启 Context。
                 try:
-                    await page.close()
+                    await context.close()
                 except Exception:
                     pass
                 try:
+                    context = await launch_export_context()
                     page = await context.new_page()
                 except Exception as retry_error:
                     raise VerificationError(
                         "EXPORT_EDGE_CLOSED: Edge 在首次导航后关闭了导出页面。"
-                        "请确认所有 Edge 窗口已关闭后重试。"
+                        "脚本已自动重启一次仍失败；请确认所有 Edge 窗口已关闭后重试。"
                     ) from retry_error
-                response = await page.goto(EARN_URL, wait_until="commit", timeout=120000)
+                response = await page.goto(
+                    EARN_URL, wait_until="commit", timeout=120000
+                )
                 try:
                     await page.wait_for_load_state("domcontentloaded", timeout=30000)
                 except Exception:
-                    print(f"[导出] 重试后页面仍在加载，当前 URL：{_display_url(page.url)}，继续诊断。")
+                    print(
+                        f"[导出] 重试后页面仍在加载，当前 URL：{_display_url(page.url)}，继续诊断。"
+                    )
             await page.wait_for_timeout(5000)
             if _is_auth_wall_url(page.url):
-                print("⚠ 跳转到登录/重新认证页面，请手动完成登录或账户条款确认后回到此处按 Enter。")
+                print(
+                    "⚠ 跳转到登录/重新认证页面，请手动完成登录或账户条款确认后回到此处按 Enter。"
+                )
                 input("登录完成后按 Enter 继续...")
-                response = await page.goto(EARN_URL, wait_until="domcontentloaded", timeout=120000)
+                response = await page.goto(
+                    EARN_URL, wait_until="domcontentloaded", timeout=120000
+                )
                 await page.wait_for_timeout(5000)
             await _require_rewards_page(page, response)
             await _scan_unfinished(page)  # 任务页可读之后才覆盖正式导出文件。
             state = await _write_storage_state(context, EXPORT_STATE_PATH)
             print(f"[导出] storage_state 已写入：{EXPORT_STATE_PATH}")
-            print(f"[导出] 将该文件拷贝到 NAS 的 REWARDS_STORAGE 路径（默认 /app/data/storage_state.json）即可。")
-            print(f"[导出] 捕获 {len(state.get('cookies', []))} 条 cookie，{len(state.get('origins', []))} 个 origin。")
+            print(
+                f"[导出] 将该文件拷贝到 NAS 的 REWARDS_STORAGE 路径（默认 /app/data/storage_state.json）即可。"
+            )
+            print(
+                f"[导出] 捕获 {len(state.get('cookies', []))} 条 cookie，{len(state.get('origins', []))} 个 origin。"
+            )
         finally:
             await context.close()
 
 
 if __name__ == "__main__":
     if "export" in sys.argv:
-        asyncio.run(export_storage_state())
+        try:
+            asyncio.run(export_storage_state())
+        except BaseException as e:
+            code = _error_code(str(e))
+            meanings = {
+                "EXPORT_EDGE_CLOSED": "Edge/Playwright 页面在首次导航后被关闭，尚未进入登录页面。",
+                "TOU_REQUIRED": "Microsoft 要求确认账户条款或重新认证。",
+                "AUTH_EXPIRED": "Microsoft 登录态已失效。",
+                "AUTH_IMPORT_INVALID": "登录态文件格式损坏或不完整。",
+                "NAVIGATION_FAILED": "Rewards 页面导航失败，可能是网络或浏览器问题。",
+            }
+            body = _build_mail_body(True, str(e)).splitlines()
+            action = next(
+                (line for line in body if line.startswith("处理：")),
+                "请查看日志和上方异常堆栈。",
+            )
+            print(f"[错误码] {code}")
+            print(
+                f"[错误含义] {meanings.get(code, '导出流程未完成，请查看上方异常堆栈。')}"
+            )
+            print(f"[建议动作] {action}")
+            raise
     elif "verify" in sys.argv:
         # 只读复检：不做任务，只报告「还差什么」，不发邮件
         asyncio.run(verify_only())
@@ -2554,7 +3241,9 @@ if __name__ == "__main__":
         except BaseException as e:
             run_state.last_run_failed = True
             traceback.print_exc()
-            _notify_mail(failed=True, error=str(e))
+            _notify_mail(failed=True, error=e)
+            _write_heartbeat(failed=True, error=str(e))
             raise
         else:
             _notify_mail(failed=run_state.last_run_failed, error="")
+            _write_heartbeat(failed=run_state.last_run_failed)
