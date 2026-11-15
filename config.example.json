@@ -12,8 +12,8 @@
     "enabled": false,
     "smtp_server": "smtp.qq.com",
     "smtp_port": 465,
-    "sender": "359083341@qq.com",
+    "sender": "your_qq_mail@example.com",
     "auth_code": "",
-    "recipient": "359083341@qq.com"
+    "recipient": "your_qq_mail@example.com"
   }
 }

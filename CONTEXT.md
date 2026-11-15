@@ -34,10 +34,11 @@
 | **认证墙 / auth wall** | Rewards 导航被重定向到登录、重新认证或账户条款页面；遇到它不能继续扫描任务 | 普通页面跳转 | `_is_auth_wall_url()` / `AuthenticationRequired` |
 | **TOU_REQUIRED** | Microsoft 要求人工确认账户条款或重新认证；NAS 无法交互，只能 Windows 端处理后重新导出 | 普通 `AUTH_EXPIRED` | `storage_state` 导出前置检查 |
 | **`storage_state.json`** | **Playwright 登录态快照，包含 cookies + origins/localStorage，属敏感文件，禁止进版本库** | 普通配置 | `data/`（已 gitignore） |
+| **认证熔断** | `auth_required.json` 记录 TOU/重新认证事件；新状态快照验证前暂停 NAS 调度 | 普通任务失败重试 | `data/auth_required.json` + `nas_cron.sh` |
 | **调度唯一事实源** | 触发本项目的**唯一**正式入口 = `nas_cron.sh`（含 `--now/--force/disabled.flag` 语义）；任何"怎么触发"的改动只改它 | 手动 ssh 起容器 | `nas_cron.sh` |
 | **profile / data 卷** | Windows 端复制 Edge profile 用于导出；NAS 端以 `storage_state.json` 为认证源，数据卷保存状态/日志 | 仓库代码 | `/app/data` |
 | **周门控状态文件** | `weekly_click_state.json`：记录 `{week, clicked, done}`，实现"每周一次" | 页面绿勾 | `weekly_click_state.json` |
-| **W2 / w2 副本** | 2026-09-16 审计重构产物 `rewards_earn.py.w2`（已提升为主版本，原版留 `.bak.W2pre_*`） | 主源 | 主源=w2 |
+| **唯一主源** | `rewards_earn.py`（已合并 2026-09-16 审计重构与后续认证熔断修复） | 主源 | 生产入口 |
 
 ## 3. 本仓库"变化最快、最怕拍脑袋"的三处（改前必读对应 ADR）
 1. **调度与立即模式限流** → `docs/adr/0001-*.md`

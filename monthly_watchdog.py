@@ -101,7 +101,7 @@ def main():
         print("[watchdog] 今日已告警过，跳过重复邮件。")
         return
 
-    # 已过周数（每月攻略共 4 周）：(day-1)//7 + 1；允许「本周还没到」漏 1 周
+    # 旧版四周活动按自然周放行；新活动是固定数量的任务，不按日期推断。
     elapsed_weeks = (day - 1) // 7 + 1
     expected_min = max(0, elapsed_weeks - 1)
 
@@ -117,12 +117,18 @@ def main():
             month = d.get("month")
             done = d.get("weekly_done", 0)
             total = d.get("weekly_total", 4)
+            scanned = d.get("weekly_scanned")
             detail = "state: month=%s weekly_done=%s/%s updated=%s" % (
                 month, done, total, d.get("updated"))
+            if scanned is not None:
+                detail += " weekly_scanned=%s" % scanned
             if month != today.strftime("%Y-%m"):
                 problems.append("monthly_state.json 月份(%s)与当前月份(%s)不符：本月攻略未更新"
                                % (month, today.strftime("%Y-%m")))
-            elif done < expected_min:
+            elif total == 4 and scanned is not None and scanned < elapsed_weeks:
+                problems.append("本月攻略只识别到 %s 行，当前应至少显示 %s 周；页面扫描结果不完整"
+                                % (scanned, elapsed_weeks))
+            elif total == 4 and done < expected_min:
                 problems.append(
                     "本月攻略进度落后：weekly_done=%s 低于期望下限 %s（已过 %s 周，%s/%s 完成）"
                     % (done, expected_min, elapsed_weeks, done, total))
@@ -139,7 +145,7 @@ def main():
         _send("【结构异常】微软积分本月攻略看门狗 %s" % today.strftime("%Y-%m-%d"), body)
         _mark_alerted()
     else:
-        print("[watchdog] OK: 本月攻略进度正常 (expected_min=%s, %s)" % (expected_min, detail))
+        print("[watchdog] OK: 本月攻略进度正常 (expected_min=%s, %s)" % (expected_min if total == 4 else 0, detail))
 
 
 if __name__ == "__main__":

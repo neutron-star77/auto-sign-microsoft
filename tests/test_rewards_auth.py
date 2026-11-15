@@ -7,6 +7,20 @@ import rewards_earn
 
 
 class RewardsAuthTests(unittest.TestCase):
+    def test_mail_error_is_actionable_and_categorized(self):
+        body = rewards_earn._build_mail_body(
+            True, "TOU_REQUIRED: Microsoft 要求重新确认账户条款"
+        )
+        self.assertIn("任务执行失败 [TOU_REQUIRED]", body)
+        self.assertIn("含义：Microsoft 要求重新确认账户条款或重新认证", body)
+        self.assertIn("自动动作：已写入 auth_required.json", body)
+        self.assertIn("执行 `python rewards_earn.py export`", body)
+
+    def test_mail_unknown_error_explains_limits_and_next_step(self):
+        body = rewards_earn._build_mail_body(True, "SOME_NEW_ERROR: test")
+        self.assertIn("含义：脚本遇到未分类异常", body)
+        self.assertIn("已停止任务并保留现有登录态", body)
+
     def test_auth_wall_urls_are_detected(self):
         self.assertTrue(
             rewards_earn._is_auth_wall_url(
@@ -41,6 +55,27 @@ class RewardsAuthTests(unittest.TestCase):
             path.write_text(json.dumps({"cookies": {}}), encoding="utf-8")
             with self.assertRaises(rewards_earn.StorageStateError):
                 rewards_earn._read_storage_state(path)
+
+    def test_auth_status_is_atomic_and_cleared_after_state_persist(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            old = rewards_earn.IS_NAS
+            old_path = rewards_earn.NAS_STORAGE_STATE
+            old_status_path = rewards_earn._auth_status_path
+            try:
+                rewards_earn.IS_NAS = True
+                rewards_earn.NAS_STORAGE_STATE = str(Path(temp_dir) / "storage_state.json")
+                rewards_earn._auth_status_path = lambda: str(Path(temp_dir) / "auth_required.json")
+                error = rewards_earn._auth_error("https://account.live.com/tou/accrue")
+                rewards_earn._mark_auth_required(error)
+                marker = Path(temp_dir) / "auth_required.json"
+                self.assertTrue(marker.exists())
+                self.assertEqual(json.loads(marker.read_text(encoding="utf-8"))["code"], "TOU_REQUIRED")
+                rewards_earn._clear_auth_required()
+                self.assertFalse(marker.exists())
+            finally:
+                rewards_earn.IS_NAS = old
+                rewards_earn.NAS_STORAGE_STATE = old_path
+                rewards_earn._auth_status_path = old_status_path
 
 
 class RewardsAuthAsyncTests(unittest.IsolatedAsyncioTestCase):

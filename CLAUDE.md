@@ -10,6 +10,7 @@
   **绝不允许只用 `open_result_view` 代替**——`open_result_view` 只是 IDE 预览，用户明确要看 Typora 渲染效果。可辅以 `open_result_view`，但 Typora 打开是必须项。（全局记忆 ID 21808785；2026-08-05 再次遗漏，已强化并补执行）
 
 - **本地源改动后部署到 NAS**：改完生产脚本先备份，再按 `nas-deploy` 唯一入口推送，完成字节、CR、权限、语法四项门禁；不得用 robocopy 覆盖已存在文件。
+- **本项目 NAS 部署路径**：当前 Windows 会话不保证存在 `Z:` 映射盘。部署 `storage_state.json` 或生产脚本时，`nas_push.ps1 -RemoteDir` 必须使用真实 Unix 路径 `/share/CACHEDEV1_DATA/Web/gadget/microsoft[/data]`；只有确认 `Z:` 已映射且可读回时才允许使用 `Z:\gadget\microsoft`。部署后必须用 `nas_ssh.ps1` 核对远端 SHA-256，不能只看推送回执。
 
 ## 1. 技能触发区分（审计 vs 签到，曾误派）
 
@@ -20,7 +21,7 @@
 ## 2. 项目知识
 
 - **本月攻略（BingMonthlyPC）月任务**：4 周、每周一个。按 `current_month_week_index()` = `(day-1)//7+1` 判定"已完成周数 >= 当前周序号"为正常，避免把 1/4（第一周）误报为未完成。`is_locked_monthly` 仅作文案兜底。
-- **NAS 运行副本**：`Z:\gadget\microsoft`（= `\\192.168.5.4\Web\gadget\microsoft`）。Docker 由 `nas_cron.sh` 以 `-v ${SCRIPT_DIR}:/app` 挂载，覆盖镜像内 `COPY` 的副本，故生产实际跑宿主该文件——这正是"改完必须部署"的原因。
+- **NAS 运行副本**：`Z:\gadget\microsoft`（= `\\<NAS_IP>\Web\gadget\microsoft`）。Docker 由 `nas_cron.sh` 以 `-v ${SCRIPT_DIR}:/app` 挂载，覆盖镜像内 `COPY` 的副本，故生产实际跑宿主该文件——这正是"改完必须部署"的原因。
 - **本地源是真相**：`f:\AI\projects\auto-sign\microsoft`（主脚本 `rewards_earn.py`）。
 
 ## 3. 统一项目文档约定（模块化，便于二次开发）

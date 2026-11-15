@@ -23,6 +23,7 @@ disabled.flag
 .run.lock
 .schedule.lock
 manual_run.state
+auth_required.json
 verify_err.txt
 verify_out.txt
 
@@ -49,3 +50,12 @@ __pycache__/
 .idea/
 .DS_Store
 Thumbs.db
+
+# ===== 公开仓库加固（2026-11-16 转公开前）=====
+# 页面截图可能带账号/积分信息，一律不入库
+*.jpg
+*.jpeg
+# 本地回滚副本（*.pre<日期>）不入库
+*.pre[0-9]*
+# 测试缓存
+.pytest_cache/
